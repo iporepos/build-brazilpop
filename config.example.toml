@@ -1,0 +1,345 @@
+# ==============================================================================
+# build-brazilpop — CONFIGURATION TEMPLATE
+# Copy to config.toml and edit the [paths] block for your machine.
+# config.toml is not committed. All data lives OUTSIDE the repository.
+#
+# Path templates accept {year} and {uf} (UF acronym, e.g. RS). Where a file
+# is per UF, the orchestrator expands them at run time.
+# ==============================================================================
+
+[project]
+name = "brazilpop"
+version = "6"                      # used in output file names: BRAZILPOP_V{version}_...
+provider = "BRAZILPOP"
+extension = "BRAZIL"               # {EXTENSION} field of the raster naming convention
+
+# ==============================================================================
+# PATHS — every data location, independently relocatable (different drives OK)
+# Inputs are read-only. Outputs must be writable. Both are validated at startup.
+# ==============================================================================
+[paths]
+# --- inputs ---
+raw_cnefe          = "/mnt/hdd1/brazilpop/raw/cnefe/{year}"
+raw_geometries     = "/mnt/hdd1/brazilpop/raw/geometries/{year}"
+raw_microdata      = "/mnt/hdd1/brazilpop/raw/microdata/{year}"
+raw_external       = "/mnt/hdd2/brazilpop/raw/external"
+raster_templates   = "/mnt/hdd1/brazilpop/templates"
+styles             = "styles"      # QML templates; the only path inside the repo
+
+# --- outputs ---
+standardized       = "/mnt/hdd2/brazilpop/02_standardized"
+enriched           = "/mnt/hdd2/brazilpop/03_enriched"
+rasters            = "/mnt/hdd3/brazilpop/04_rasters"
+benchmarks         = "/mnt/hdd3/brazilpop/benchmarks"
+logs               = "logs"
+
+# ==============================================================================
+# EXECUTION
+# ==============================================================================
+[execution]
+target_year = 2022
+target_ufs  = ["RS"]               # empty list = all UFs found in raw_cnefe
+log_level   = "INFO"
+write_parquet = false              # also write a .parquet copy of each vector intermediate
+overwrite     = false              # refuse to overwrite existing outputs unless true
+
+run_stage_1_ingestion     = true
+run_stage_2_enrichment    = true
+run_stage_3_rasterization = true
+run_stage_4_benchmarking  = true
+
+[scripts]
+orchestrator         = "run_pipeline.py"
+stage_1_manager      = "stages/stage_01_ingest_manager.py"
+stage_2_enrichment   = "stages/stage_02_vector_enrichment.py"
+stage_3_rasterization = "stages/stage_03_additive_rasterize.py"
+stage_4_benchmarking = "stages/stage_04_benchmark.py"
+
+# ==============================================================================
+# RESOLUTIONS — one table drives file names, templates, styles and benchmarks
+# All grids: EPSG:4326, shared origin, exact integer multiples of the 030 grid.
+# ==============================================================================
+[resolutions.030]
+arcsec   = 1
+res_deg  = 0.0002777777777777778   # 1/3600
+nominal  = "30m"
+template = "BRAZILPOP_TEMPLATE_030.tif"     # blank UInt16 grid, in paths.raster_templates
+
+[resolutions.01C]
+arcsec   = 3
+res_deg  = 0.0008333333333333334   # 1/1200
+nominal  = "100m"
+template = "BRAZILPOP_TEMPLATE_01C.tif"
+
+[resolutions.01K]
+arcsec   = 30
+res_deg  = 0.008333333333333333    # 1/120
+nominal  = "1km"
+template = "BRAZILPOP_TEMPLATE_01K.tif"
+
+# ==============================================================================
+# STAGE 1 — INGESTION (one adapter per census vintage)
+# Every adapter emits the Minimal Canonical Contract (see README):
+#   id_origem, geometry, is_household, cod_especie, tipo_especie,
+#   subtipo_domicilio, ano_censo, sigla_uf
+# ==============================================================================
+[ingestion]
+output_pattern = "cnefe_{year}_{uf}_standardized.gpkg"
+layer_name     = "addresses"
+
+# Profiling sidecar: distinct codes and counts per field, per UF. Catalogs are written from this.
+inventory_pattern   = "cnefe_{year}_{uf}_code_inventory.csv"
+fail_on_unknown_codes = false     # true = stop if a code is missing from [codes.<year>]; false = log and count
+
+[ingestion.2022]
+adapter      = "stages/adapters/parse_cnefe_2022.py"
+file_pattern = "{uf_id}_{uf}.csv"
+encoding     = "utf-8"
+delimiter    = ";"
+
+col_id        = "ID_ENDERECO"
+col_lon       = "LONGITUDE"
+col_lat       = "LATITUDE"
+col_species   = "COD_ESPECIE"
+household_species_codes = [1, 2]       # CONFIRMED by popbr_cnefe2022_rasterize.py (TOTAL-DOMICILIOS = COD_ESPECIE IN (1, 2))
+
+# Household typology. The code (not the label) is what the raster SPEC is keyed on.
+has_subtypes = true
+col_subtype  = "COD_TIPO_ESPECI"       # UNVERIFIED: named in the rasterize script docstring only; confirm on real data
+
+[ingestion.2010]
+adapter      = "stages/adapters/parse_cnefe_2010.py"   # to be integrated from colleagues' scripts
+file_pattern = "{uf_id}.txt"
+encoding     = "latin-1"
+delimiter    = ";"
+
+col_id        = "ID_REGISTRO"
+col_lon       = "PNT_LON"
+col_lat       = "PNT_LAT"
+col_species   = "TIPO_DOM"
+household_species_codes = []           # TODO: define once 2010 classification dictionary is resolved
+
+has_subtypes = false
+col_subtype  = ""
+
+# ------------------------------------------------------------------------------
+# CODE DICTIONARIES — single source of truth for codes, labels and SPEC strings.
+# Adapters use them to fill tipo_especie / subtipo_domicilio. Stage 1 asserts that
+# every code observed in the raw data is declared here; unknown codes are logged
+# and counted, never silently dropped. Stage 3 builds its layers from these codes.
+# ------------------------------------------------------------------------------
+[codes.2022.especie]               # COD_ESPECIE (confirmed by the rasterize script)
+1 = { label = "domicilio_particular", household = true,  desc = "Domicílio particular" }
+2 = { label = "domicilio_coletivo",   household = true,  desc = "Domicílio coletivo" }
+3 = { label = "agropecuario",         household = false, desc = "Estabelecimento agropecuário" }
+4 = { label = "ensino",               household = false, desc = "Estabelecimento de ensino" }
+5 = { label = "saude",                household = false, desc = "Estabelecimento de saúde" }
+6 = { label = "outras_finalidades",   household = false, desc = "Estabelecimento de outras finalidades" }
+7 = { label = "construcao",           household = false, desc = "Edificação em construção ou reforma" }
+8 = { label = "religioso",            household = false, desc = "Estabelecimento religioso" }
+
+[codes.2022.subtipo]               # household subtype codes. UNVERIFIED: from the README, check against raw data and IBGE dictionary
+101 = { label = "casa",        desc = "Casa" }
+102 = { label = "casa_vila",   desc = "Casa de vila ou em condomínio" }
+103 = { label = "apartamento", desc = "Apartamento" }
+104 = { label = "outro",       desc = "Outro" }
+
+[codes.2010]
+# TODO: fill from the 2010 adapter once the legacy dictionary is resolved.
+# Leaving the tables empty makes Stage 3 skip the species and subtype rasters for 2010.
+especie = {}
+subtipo = {}
+
+# ==============================================================================
+# STAGE 2 — VECTOR ENRICHMENT & DENSITY (delta_T = P_T / H_T,i)
+# ==============================================================================
+[enrichment]
+output_pattern  = "cnefe_{year}_{uf}_enriched.gpkg"
+balance_pattern = "cnefe_{year}_{uf}_balance.gpkg"
+
+# Tract geometry (point-in-polygon target)
+tract_gpkg  = "{raw_geometries}/setores_{year}_{uf}.gpkg"
+tract_layer = "setores"
+tract_code_column = "CD_SETOR"
+
+# Ground-truth microdata (P_T, H_T)
+microdata_path        = "{raw_microdata}/agregados_setores_{year}_{uf}.parquet"
+microdata_tract_code  = "CD_SETOR"
+population_column     = "POP_TOTAL"
+household_column      = "DOM_TOTAL"
+
+# Output field names added to each address point
+out_tract_code = "cd_setor"
+out_h_ti       = "h_ti"            # H_T,i  physical household points in the tract
+out_delta_t    = "delta_t"         # delta_T = P_T / H_T,i  (NULL where H_T,i = 0)
+out_orphan     = "orphan"
+
+# Sectors with P_T > 0 and H_T,i = 0:  "centroid_fallback" | "log_only"
+orphan_policy = "centroid_fallback"
+
+# ==============================================================================
+# STAGE 3 — DIRECT ADDITIVE RASTERIZATION
+# ==============================================================================
+[rasterization]
+resolutions = ["030", "01C", "01K"]
+crs = "EPSG:4326"
+output_dir_pattern = "{rasters}/{year}/{resolution}"
+
+# File names. SPEC is optional: layers with a spec use the first pattern, layers without use the second.
+#   BRAZILPOP_V6_CNEFE_ADDRESS-01_030_BRAZIL_2022.tif
+#   BRAZILPOP_V6_POPULATION_RESIDENT_030_BRAZIL_2022.tif
+name_pattern_spec   = "{provider}_V{version}_{variable}_{variant}-{spec}_{resolution}_{extension}_{year}.tif"
+name_pattern_nospec = "{provider}_V{version}_{variable}_{variant}_{resolution}_{extension}_{year}.tif"
+
+[rasterization.encoding.counts]
+dtype      = "uint16"
+nodata     = 65535                 # max valid count per cell = 65534
+fill_value = 0
+warn_on_saturation = true          # log if any cell reaches 65534
+
+[rasterization.encoding.population]
+dtype      = "float32"
+nodata     = -9999.0
+fill_value = 0.0
+
+[rasterization.geotiff_profile]
+tiled   = true
+blockxsize = 512
+blockysize = 512
+compress = "ZSTD"
+predictor_integer = 2
+predictor_float   = 3
+build_overviews   = true
+overview_resampling = "SUM"
+overview_levels   = [2, 4, 8, 16, 32]
+
+# ------------------------------------------------------------------------------
+# LAYER CATALOG — varies by census year.
+#
+#   core        layers every vintage MUST produce (they only need the canonical
+#               contract: geometry, is_household, and delta_t from Stage 2)
+#   <year>      extra layers that vintage's data can truthfully support
+#
+# Filters (all optional, combined with logical AND; none = every point):
+#   flag    = boolean canonical column that must be 1   (e.g. "is_household")
+#   species = cod_especie values to count
+#   subtype = cod_subtipo values to count
+#
+# Rules:
+#   * SPEC meaning is stable across years: ADDRESS-08 always means religious. A year
+#     without that category has no ADDRESS-08 file. A different category never
+#     reuses an existing SPEC number.
+#   * A layer that a year cannot support is NOT written as an all-zero raster, since
+#     zeros would claim "none exist" when the truth is "not recorded".
+#   * SPEC strings are explicit and zero-padded as in the file name (2 digits for
+#     species, 3 for household subtypes). Never derived.
+#   * Catalogs are authored after profiling: Stage 1 writes a code inventory per UF
+#     (see [ingestion]). At startup every species/subtype code used by a catalog
+#     must exist in [codes.<year>], or the run stops.
+#   * class "count" -> UInt16 encoding, "population" -> Float32 encoding.
+# ------------------------------------------------------------------------------
+[rasterization.catalog.core]
+layers = [
+  { variable = "CNEFE", variant = "ADDRESS",   spec = "00",  class = "count" },
+  { variable = "CNEFE", variant = "HOUSEHOLD", spec = "000", class = "count", flag = "is_household" },
+  # Population has no SPEC. Burns delta_t for every household point.
+  { variable = "POPULATION", variant = "RESIDENT", class = "population", source = "delta_t" },
+]
+
+[rasterization.catalog.2022]
+layers = [
+  { variable = "CNEFE", variant = "ADDRESS", spec = "01", class = "count", species = [1] },
+  { variable = "CNEFE", variant = "ADDRESS", spec = "02", class = "count", species = [2] },
+  { variable = "CNEFE", variant = "ADDRESS", spec = "03", class = "count", species = [3] },
+  { variable = "CNEFE", variant = "ADDRESS", spec = "04", class = "count", species = [4] },
+  { variable = "CNEFE", variant = "ADDRESS", spec = "05", class = "count", species = [5] },
+  { variable = "CNEFE", variant = "ADDRESS", spec = "06", class = "count", species = [6] },
+  { variable = "CNEFE", variant = "ADDRESS", spec = "07", class = "count", species = [7] },
+  { variable = "CNEFE", variant = "ADDRESS", spec = "08", class = "count", species = [8] },
+  { variable = "CNEFE", variant = "HOUSEHOLD", spec = "101", class = "count", flag = "is_household", subtype = [101] },
+  { variable = "CNEFE", variant = "HOUSEHOLD", spec = "102", class = "count", flag = "is_household", subtype = [102] },
+  { variable = "CNEFE", variant = "HOUSEHOLD", spec = "103", class = "count", flag = "is_household", subtype = [103] },
+  { variable = "CNEFE", variant = "HOUSEHOLD", spec = "104", class = "count", flag = "is_household", subtype = [104] },
+]
+
+[rasterization.catalog.2010]
+# TODO: fill after profiling the 2010 data (which species and subtype codes exist).
+# Do not assume the 2022 categories. Core layers are produced regardless.
+layers = []
+
+# One row per layer and year: produced or skipped, and why
+[rasterization.manifest]
+write   = true
+pattern = "{rasters}/{year}/manifest_{year}.csv"
+
+# Consistency checks run after burning (results logged, failures flagged)
+[rasterization.checks]
+household_total_equals_species_1_plus_2 = true   # HOUSEHOLD-000 == ADDRESS-01 + ADDRESS-02, cell by cell (only if both exist in the year's catalog)
+subtype_sum_vs_household_total = true            # sum of HOUSEHOLD-1xx vs HOUSEHOLD-000; residual = households with unknown subtype (only if subtype layers exist)
+population_total_vs_microdata  = true            # sum of POPULATION vs sum of P_T (mass conservation)
+
+# Regression oracle for 2022: compare against rasters produced by popbr_cnefe2022_rasterize.py
+[rasterization.regression]
+enabled = false
+reference_dir = "/mnt/hdd3/brazilpop/reference_rasters_2022"   # outputs of the legacy script
+compare = "cellwise"               # cellwise equality for counts; totals compared first
+
+# QML sidecars: class x resolution -> template in paths.styles
+[rasterization.styles]
+address_030    = "address_030.qml"
+address_01C    = "address_01C.qml"
+address_01K    = "address_01K.qml"
+population_030 = "population_030.qml"
+population_01C = "population_01C.qml"
+population_01K = "population_01K.qml"
+
+# Optional post-processing (popbr_cnefe2022_mask.py)
+[rasterization.mask]
+enabled       = false
+mask_path     = "/mnt/hdd1/brazilpop/masks/mask_brazil.tif"
+buffer_pixels = 0
+
+# ==============================================================================
+# STAGE 4 — BENCHMARKING
+# ==============================================================================
+[benchmarking]
+scales = ["tract", "district", "municipality", "state"]
+master_layer_pattern = "benchmark_{year}_{uf}_tracts.gpkg"
+table_pattern        = "benchmark_{year}_{uf}_{scale}.csv"
+metrics_pattern      = "benchmark_{year}_{uf}_metrics.csv"
+write_parquet_tables = true
+
+[benchmarking.boundaries]
+tract_gpkg        = "{raw_geometries}/setores_{year}_{uf}.gpkg"
+district_gpkg     = "{raw_geometries}/distritos_{year}_{uf}.gpkg"
+municipality_gpkg = "{raw_geometries}/municipios_{year}_{uf}.gpkg"
+state_gpkg        = "{raw_geometries}/uf_{year}_{uf}.gpkg"
+
+# Resolution used for each product's zonal statistics, and the minimum scale
+# at which it is fairly evaluated (native cell size vs. unit size)
+[benchmarking.products.brazilpop]
+resolutions = ["030", "01C", "01K"]
+min_scale   = "tract"
+
+[benchmarking.products.worldpop]
+raster    = "{raw_external}/worldpop_{year}_{uf}.tif"
+min_scale = "district"
+
+[benchmarking.products.hrsl]
+raster    = "{raw_external}/meta_hrsl_{uf}.tif"
+min_scale = "district"
+
+[benchmarking.products.ghsl]
+raster    = "{raw_external}/ghsl_pop_{year}_{uf}.tif"
+min_scale = "district"
+
+[benchmarking.products.landscan]
+raster    = "{raw_external}/landscan_{year}_{uf}.tif"
+min_scale = "municipality"
+
+[benchmarking.metrics]
+bias = true
+mae  = true
+rmse = true
+mape = true
+state_mass_gap = true

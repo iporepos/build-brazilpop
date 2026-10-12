@@ -16,6 +16,10 @@ compared with the census total `P_K` of the same unit:
 
 Columns are named `pi_sum_<product>`, `pi_count_<product>` (cells counted), and
 `err_<product>`, `pct_err_<product>` (error against the census).
+
+When the tables are written, the charts of tools/plot_benchmark.py are drawn into
+`<output_dir>/plots` (see `plots`, `plot_kinds`, `plot_scales` in [benchmarking]; `--no-plots`
+skips them). A chart that fails never costs the results: it is reported and the stage ends OK.
 """
 
 from __future__ import annotations
@@ -345,12 +349,36 @@ def benchmark(cfg: dict, year: int, ufs: list[str], overwrite: bool | None = Non
     return report
 
 
+def run_plots(cfg: dict, config_path: str, year: int) -> list[Path]:
+    """Draw the charts of tools/plot_benchmark.py from the tables just written. Never raises:
+    the tables are the result of the stage and a missing font or backend must not discard them."""
+    b = cfg.get("benchmarking", {})
+    if not b.get("plots", True):
+        return []
+    try:
+        from tools.plot_benchmark import build
+        written: list[Path] = []
+        scales = tuple(b.get("plot_scales", ["tract", "district", "municipality"]))
+        for kind in b.get("plot_kinds", ["scatter", "hexbin"]):
+            for path in build(config_path, year, None, b.get("plot_mode", "light"), int(b.get("plot_dpi", 150)),
+                              kind=kind, scales=scales):
+                if path not in written:
+                    written.append(path)
+        log.info("charts: %d files in %s", len(written), written[0].parent if written else "-")
+        return written
+    except Exception as e:                                   # noqa: BLE001 - see the docstring
+        log.error("the tables are written but the charts failed (%s: %s); run tools/plot_benchmark.py "
+                  "to retry", type(e).__name__, e)
+        return []
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--config", required=True)
     ap.add_argument("--year", type=int, help="census year (default: execution.target_year)")
     ap.add_argument("--uf", action="append", help="UF acronym, repeatable (default: all UFs found)")
     ap.add_argument("--overwrite", action="store_true", help="replace existing outputs")
+    ap.add_argument("--no-plots", action="store_true", help="do not draw the charts after the tables")
     args = ap.parse_args(argv)
     try:
         cfg = load_config(args.config)
@@ -362,6 +390,8 @@ def main(argv: list[str] | None = None) -> int:
             raise ConfigError("No UFs to process")
         rep = benchmark(cfg, year, ufs, overwrite=True if args.overwrite else None)
         log.info("done in %ss: %s", rep["seconds"], rep["report_path"])
+        if not args.no_plots:
+            run_plots(cfg, args.config, year)
     except (ConfigError, FileExistsError, ZonalError) as e:
         print(f"ERROR: {e}", file=sys.stderr)
         return 1

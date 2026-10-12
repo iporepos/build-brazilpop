@@ -234,3 +234,21 @@ def test_census_units_without_a_polygon_are_listed(tmp_path):
     assert rep["census_units_without_polygon"]["district"] == 1
     saved = json.loads((tmp_path / "out" / "benchmark_2022_report.json").read_text())
     assert saved["census_units_without_polygon_codes"]["district"] == [D1]
+
+
+def test_charts_are_drawn_after_the_tables_and_never_break_the_stage(monkeypatch, tmp_path):
+    from stages import stage_04_benchmark as s4
+    cfg = {"benchmarking": {"plots": False}}
+    assert s4.run_plots(cfg, "x.toml", 2022) == []                      # switched off
+
+    import tools.plot_benchmark as pb
+    calls = []
+    monkeypatch.setattr(pb, "build", lambda config, year, out, mode, dpi, **kw: calls.append(kw) or [tmp_path / "a.png"])
+    cfg = {"benchmarking": {"plot_kinds": ["scatter", "hexbin"], "plot_scales": ["tract", "district"]}}
+    assert s4.run_plots(cfg, "x.toml", 2022) == [tmp_path / "a.png"]    # one kind each, the bars once
+    assert [c["kind"] for c in calls] == ["scatter", "hexbin"] and calls[0]["scales"] == ("tract", "district")
+
+    def boom(*a, **k):
+        raise RuntimeError("no display")
+    monkeypatch.setattr(pb, "build", boom)
+    assert s4.run_plots(cfg, "x.toml", 2022) == []                      # a failure is reported, not raised

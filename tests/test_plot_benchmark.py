@@ -103,8 +103,46 @@ def test_benchmark_bars_are_a_lighter_gray_than_the_scatter_points():
     assert color_of("brazilpop", neutral=BAR_NEUTRAL) == ACCENT["light"]
 
 
-def test_panel_background_is_a_subtle_gray_close_to_the_surface():
+def test_panel_background_is_a_light_tone_close_to_the_surface():
     from tools.plot_benchmark import SURFACE
     for mode in ("light", "dark"):
         a, b = _luminance(PANEL[mode]), _luminance(SURFACE[mode])
-        assert a != b and abs(a - b) < 0.1           # a visible tint, never a block of tone
+        assert a != b and abs(a - b) < 0.2           # the seaborn tone: visible, never a block of colour
+
+
+def test_a_product_without_data_is_drawn_as_a_null_bar_and_a_null_panel(tmp_path):
+    t, m = frames()
+    keys = PRODUCTS + ["hrsl"]
+    f1 = scatter_truth_vs_pred(t, m, keys, tmp_path / "s.png", "t", null_products=["hrsl"])
+    f2 = bars_metrics_by_scale(m, keys, tmp_path / "b.png", "t", null_products=["hrsl"])
+    assert f1.stat().st_size > 0 and f2.stat().st_size > 0
+
+
+def test_scatter_panels_are_three_across_then_the_rest_below(tmp_path):
+    from PIL import Image
+    keys = ["brazilpop", "landscan", "worldpop", "ghsl"]
+    t, m = frames(keys)
+    three = scatter_truth_vs_pred(t, m, keys[:3], tmp_path / "s3.png", "t")
+    five = scatter_truth_vs_pred(t, m, keys + ["hrsl"], tmp_path / "s5.png", "t", null_products=["hrsl"])
+    (w3, h3), (w5, h5) = Image.open(three).size, Image.open(five).size
+    assert abs(w3 - w5) < 0.05 * w3          # same three columns whatever the number of products
+    assert h5 > 1.6 * h3                     # the fourth and fifth panels open a second row
+
+
+@pytest.mark.parametrize("kind", ["scatter", "hexbin"])
+@pytest.mark.parametrize("scale,units", [("district", 4), ("municipality", 1), ("state", 1)])
+def test_coarse_scales_with_very_few_units_are_drawn(tmp_path, kind, scale, units):
+    rng = np.random.default_rng(2)
+    truth = rng.integers(500_000, 3_000_000, units).astype(float)
+    t = pd.DataFrame({"code": [str(i) for i in range(units)], "p_k": truth})
+    for i, k in enumerate(PRODUCTS):
+        t[f"pi_sum_{k}"] = truth * (1 + 0.02 * i)
+    m = frames()[1]
+    out = scatter_truth_vs_pred(t, m, PRODUCTS, tmp_path / "s.png", "t", kind=kind, scale=scale)
+    assert out.stat().st_size > 0
+
+
+def test_a_product_not_scored_at_a_scale_gets_an_empty_panel(tmp_path):
+    t = pd.DataFrame({"code": ["1"], "p_k": [1000.0], "pi_sum_brazilpop": [990.0], "pi_sum_landscan": [np.nan]})
+    out = scatter_truth_vs_pred(t, frames()[1], PRODUCTS, tmp_path / "s.png", "t", scale="municipality")
+    assert out.stat().st_size > 0

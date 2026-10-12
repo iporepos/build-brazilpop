@@ -268,6 +268,14 @@ table_pattern   = "benchmark_{year}_{scale}.csv"      # one table per scale
 metrics_pattern = "benchmark_{year}_metrics.csv"      # bias, MAE, RMSE, MAPE and totals per product and scale
 report_pattern  = "benchmark_{year}_report.json"
 
+# Charts drawn when the tables are written (tools/plot_benchmark.py; `--no-plots` skips them).
+# They go to {output_dir}/plots. A chart that fails never costs the tables.
+plots        = true
+plot_kinds   = ["scatter", "hexbin"]                     # one dots-per-unit figure and one hexagon-density figure per scale
+plot_scales  = ["tract", "district", "municipality"]    # "state" may be added
+plot_mode    = "light"                                   # or "dark"
+plot_dpi     = 150
+
 # District and municipality polygons per census year, in YOUR file naming and columns.
 # `<scale>_name_column` is optional (a readable name in the tables).
 [benchmarking.2022]
@@ -299,7 +307,7 @@ municipality_name_column = "name"
 # scale, except the ones listed in `resolution_by_scale`: here tracts are sampled from the
 # 30 m raster (a quality check) and the larger units from the 100 m raster.
 [benchmarking.products.brazilpop]
-label             = "BrazilPop"
+label             = "BrazilPop V{version} {year}"   # {version} = [project] version, {year} = benchmark year
 stage3_resolution = "01C"
 min_scale         = "tract"
 
@@ -309,20 +317,29 @@ tract = "030"
 # External rasters: a full path (may use {year}). EPSG:4326, one band, NoData declared.
 # Add one block per benchmark; nothing else changes.
 [benchmarking.products.landscan]
-label     = "LandScan"
+label     = "LandScan {year}"
 raster    = "/media/ipo/Feynman/planalto/ZENODO/BRAZILPOP/V500/T1/ASSETS/BCMK/LANDSCAN_BRAZIL_{year}.tif"
 min_scale = "municipality"
 years     = [2022]
 
 [benchmarking.products.worldpop]
-label     = "WorldPop"
+label     = "WorldPop {year}"
 raster    = "/media/ipo/Feynman/planalto/ZENODO/BRAZILPOP/V500/T1/ASSETS/BCMK/WORLDPOP_BRAZIL_{year}.tif"
 min_scale = "municipality"
 years     = [2022]
 
 # The GHSL epoch is 2020 while the census is 2022: the path has no {year} and the label says so.
 [benchmarking.products.ghsl]
-label     = "GHSL (2020)"
+label     = "GHSL 2020"
 raster    = "/media/ipo/Feynman/planalto/ZENODO/BRAZILPOP/V500/T1/ASSETS/BCMK/GHSL_BRAZIL_2020.tif"
+min_scale = "municipality"
+years     = [2022]
+
+# HRSL (Meta) is a 2018 snapshot, built as a virtual mosaic of its four tiles by
+# scripts/merge_hrsl.py (mode vrt). Float64, NoData NaN. Until its column exists in the
+# Stage 4 table, the charts show it as a null bar and a "no data" panel.
+[benchmarking.products.hrsl]
+label     = "HRSL V1 2018"
+raster    = "/media/ipo/Feynman/planalto/META/HRSL/V1/T1/ASSETS/HRSL_BRAZIL_2018.vrt"
 min_scale = "municipality"
 years     = [2022]

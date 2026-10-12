@@ -80,51 +80,54 @@ def _filter_prefix(df: pd.DataFrame, col: str, prefix: str) -> pd.DataFrame:
 
 # ----------------------------------------------------------------------------- tracts
 
-def load_tracts(cfg: dict, year: int, uf: str) -> gpd.GeoDataFrame:
-    """Tract polygons of one UF in EPSG:4326, with a string `tract_code` column.
+def _read_polygons(path: Path, layer: str | None, col: str, prefix: str, what: str, uf: str,
+                   out_col: str, name_col: str | None = None) -> gpd.GeoDataFrame:
+    """Polygons of one UF (code prefix) in EPSG:4326 with a string code column `out_col`.
 
-    `gdf.attrs["report"]` holds what was found and repaired.
+    Shared by tracts, districts and municipalities. Polygons that share a code (islands,
+    river and lake fragments) are merged into one multi-part geometry; they are listed in
+    `gdf.attrs["duplicates"]`. `gdf.attrs["report"]` holds what was found and repaired.
+    If `name_col` is given, a `name` column is kept (the first name of a merged code).
     """
-    b = year_block(cfg, "enrichment", year)
-    path = Path(expand(b["tract_path"], cfg, year=year, uf=uf))
-    col = b["tract_code_column"]
-    prefix = _uf_prefix(cfg, uf)
-    where = f"tracts ({path.name})"
+    where = f"{what} ({path.name})"
     suffix = path.suffix.lower()
+    wanted = [col] + ([name_col] if name_col else [])
 
     if suffix in PARQUET_EXT:
         layer = None
         gdf = gpd.read_parquet(path)
-        _require_columns([col], list(gdf.columns), where)
-        gdf = _filter_prefix(gdf, col, prefix)[[col, gdf.geometry.name]]
+        _require_columns(wanted, list(gdf.columns), where)
+        gdf = _filter_prefix(gdf, col, prefix)[wanted + [gdf.geometry.name]]
         gdf = gdf.set_geometry(gdf.geometry.name)
     else:
-        layer = _ogr_layer(path, b.get("tract_layer"), where)
-        _require_columns([col], list(read_info(path, layer=layer)["fields"]), f"{where} layer '{layer}'")
+        layer = _ogr_layer(path, layer, where)
+        _require_columns(wanted, list(read_info(path, layer=layer)["fields"]), f"{where} layer '{layer}'")
         if suffix in SQL_FILTER_EXT:
-            gdf = read_dataframe(path, layer=layer, columns=[col], where=_uf_where(col, prefix))
+            gdf = read_dataframe(path, layer=layer, columns=wanted, where=_uf_where(col, prefix))
         else:
-            gdf = _filter_prefix(read_dataframe(path, layer=layer, columns=[col]), col, prefix)
+            gdf = _filter_prefix(read_dataframe(path, layer=layer, columns=wanted), col, prefix)
 
     if gdf.crs is None:
-        raise ConfigError(f"{where}: the tract geometry has no CRS")
+        raise ConfigError(f"{where}: the geometry has no CRS")
     _check_code_dtype(gdf[col], where)
 
     src_crs = gdf.crs.to_string()
-    gdf = gdf.rename(columns={col: "tract_code"})
-    gdf["tract_code"] = _clean_code(gdf["tract_code"])
+    gdf = gdf.rename(columns={col: out_col})
+    if name_col:
+        gdf = gdf.rename(columns={name_col: "name"})
+    gdf[out_col] = _clean_code(gdf[out_col])
 
     rep = {
-        "uf": uf, "tract_source": path.name, "tract_layer": layer,
+        "uf": uf, "source": path.name, "layer": layer,
         "source_crs": src_crs, "target_crs": TARGET_CRS,
         "features": len(gdf),
-        "null_code": int(gdf["tract_code"].isna().sum()),
+        "null_code": int(gdf[out_col].isna().sum()),
         "null_geometry": int(gdf.geometry.isna().sum() + gdf.geometry.is_empty.sum()),
     }
     if len(gdf) == 0:
-        raise ConfigError(f"{where}: no tracts with code prefix {prefix}")
+        raise ConfigError(f"{where}: no polygons with code prefix {prefix}")
     if rep["null_code"]:
-        raise ConfigError(f"{where}: {rep['null_code']} tract polygons have no code")
+        raise ConfigError(f"{where}: {rep['null_code']} polygons have no code")
 
     gdf = gdf[~(gdf.geometry.isna() | gdf.geometry.is_empty)].copy()
 
@@ -133,31 +136,72 @@ def load_tracts(cfg: dict, year: int, uf: str) -> gpd.GeoDataFrame:
     if invalid.any():
         gdf.loc[invalid, "geometry"] = shapely.make_valid(gdf.loc[invalid, "geometry"].to_numpy())
 
-    # A tract can be stored as several polygons (islands, river or lake fragments), all with
-    # the same code. They are one tract: the parts are merged into one multi-part geometry, so
-    # the code stays unique and the microdata (one row per code) is related once. The merged
-    # codes are listed in gdf.attrs["duplicates"] for the sidecar.
-    dup = gdf["tract_code"].duplicated(keep=False)
-    parts = pd.DataFrame({"tract_code": pd.Series(dtype="string"), "parts": pd.Series(dtype="int64")})
+    # One code stored as several polygons: one unit. Merge the parts so the code stays unique
+    # and the microdata (one row per code) is related once.
+    keep = [out_col] + (["name"] if name_col else []) + ["geometry"]
+    dup = gdf[out_col].duplicated(keep=False)
+    parts = pd.DataFrame({out_col: pd.Series(dtype="string"), "parts": pd.Series(dtype="int64")})
     if dup.any():
-        parts = (gdf[dup].groupby("tract_code").size().rename("parts").reset_index()
-                 .sort_values("tract_code").reset_index(drop=True))
-        merged = gdf[dup].dissolve(by="tract_code", as_index=False)[["tract_code", "geometry"]]
-        gdf = pd.concat([gdf[~dup][["tract_code", "geometry"]], merged], ignore_index=True)
+        parts = (gdf[dup].groupby(out_col).size().rename("parts").reset_index()
+                 .sort_values(out_col).reset_index(drop=True))
+        merged = gdf[dup].dissolve(by=out_col, as_index=False, aggfunc="first")[keep]
+        gdf = pd.concat([gdf[~dup][keep], merged], ignore_index=True)
         gdf = gpd.GeoDataFrame(gdf, geometry="geometry", crs=merged.crs)
-        gdf["tract_code"] = gdf["tract_code"].astype("string")
-        log.warning("%s: %s tract codes were stored as several polygons (%s features); merged by code",
-                    uf, f"{len(parts):,}", f"{int(dup.sum()):,}")
+        gdf[out_col] = gdf[out_col].astype("string")
+        log.warning("%s: %s %s codes were stored as several polygons (%s features); merged by code",
+                    uf, f"{len(parts):,}", what, f"{int(dup.sum()):,}")
     rep["duplicate_code_groups"] = len(parts)
     rep["duplicate_code_features"] = int(dup.sum())
-    rep["tracts"] = len(gdf)
+    rep["polygons"] = len(gdf)
 
-    gdf = gdf.to_crs(TARGET_CRS)  # always transform, even when the source is already 4326
+    gdf = gdf[keep].to_crs(TARGET_CRS)  # always transform, even when the source is already 4326
     gdf = gdf.reset_index(drop=True)
     gdf.attrs["report"] = rep
     gdf.attrs["duplicates"] = parts
-    log.info("%s: %s tracts read (%s -> %s)", uf, f"{len(gdf):,}", src_crs, TARGET_CRS)
+    log.info("%s: %s %s read (%s -> %s)", uf, f"{len(gdf):,}", what, src_crs, TARGET_CRS)
     return gdf
+
+
+def load_tracts(cfg: dict, year: int, uf: str) -> gpd.GeoDataFrame:
+    """Tract polygons of one UF in EPSG:4326, with a string `tract_code` column.
+
+    Tract codes stored as several polygons are merged (listed in `gdf.attrs["duplicates"]`);
+    `gdf.attrs["report"]` holds what was found and repaired.
+    """
+    b = year_block(cfg, "enrichment", year)
+    path = Path(expand(b["tract_path"], cfg, year=year, uf=uf))
+    gdf = _read_polygons(path, b.get("tract_layer"), b["tract_code_column"], _uf_prefix(cfg, uf),
+                         "tracts", uf, out_col="tract_code")
+    rep = gdf.attrs["report"]
+    # names kept from before the refactor
+    rep.update(tract_source=rep["source"], tract_layer=rep["layer"], tracts=rep["polygons"])
+    return gdf
+
+
+# Config keys of the district and municipality polygons in [benchmarking.<year>].
+BOUNDARY_KEYS = {
+    "district": {"path": "district_path", "layer": "district_layer",
+                 "code": "district_code_column", "name": "district_name_column"},
+    "municipality": {"path": "municipality_path", "layer": "municipality_layer",
+                     "code": "municipality_code_column", "name": "municipality_name_column"},
+}
+
+
+def load_boundaries(cfg: dict, year: int, scale: str, uf: str) -> gpd.GeoDataFrame:
+    """District or municipality polygons of one UF in EPSG:4326: columns `code`, `name`, geometry.
+
+    The keys are listed in BOUNDARY_KEYS; the name column is optional.
+    """
+    if scale not in BOUNDARY_KEYS:
+        raise ConfigError(f"no boundary layer for scale '{scale}' (expected one of {sorted(BOUNDARY_KEYS)})")
+    keys = BOUNDARY_KEYS[scale]
+    b = year_block(cfg, "benchmarking", year)
+    for k in ("path", "code"):
+        if not b.get(keys[k]):
+            raise ConfigError(f"[benchmarking.{year}] missing required key '{keys[k]}'")
+    path = Path(expand(b[keys["path"]], cfg, year=year, uf=uf))
+    return _read_polygons(path, b.get(keys["layer"]), b[keys["code"]], _uf_prefix(cfg, uf),
+                          scale, uf, out_col="code", name_col=b.get(keys["name"]) or None)
 
 
 # ------------------------------------------------------------------------- microdata

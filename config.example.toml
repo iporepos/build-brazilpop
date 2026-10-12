@@ -205,15 +205,19 @@ name_pattern_nospec = "{provider}_V{version}_{variable}_{variant}_{resolution}_{
 dtype      = "uint16"
 nodata     = 65535                 # max valid count per cell = 65534
 fill_value = 0
-warn_on_saturation = true          # counts are accumulated in UInt32 and clipped to 65534 at the end, with a warning
+warn_on_saturation = true          # a cell that reaches 65535 (the NoData value) is reported: UInt16 adds stop there
 
 [rasterization.encoding.population]
 dtype      = "float32"
 nodata     = -9999.0
 fill_value = 0.0
 
-# Final rasters are written with the GDAL COG driver (tiled, lossless).
+# Counts are burned straight into a copy of the template, as the legacy script did, so the
+# output has the template's own layout and compression. `write_cog = true` adds a last step
+# that rewrites each raster as a Cloud Optimized GeoTIFF with the settings below (this also
+# compacts the file, which grows a little with every UF pass). Off by default.
 [rasterization.geotiff_profile]
+write_cog = false
 blocksize = 512
 compress  = "ZSTD"
 predictor_integer = 2
@@ -224,7 +228,7 @@ predictor_float   = 3
 build_overviews     = false
 overview_resampling = "AVERAGE"
 
-# One row per raster: layer, status, total, maximum, whether it was clipped, file
+# One row per raster: layer, status, total, maximum, whether it saturated, file
 [rasterization.manifest]
 write   = true
 pattern = "{output_dir}/manifest_{year}.csv"
@@ -241,7 +245,84 @@ population_total_vs_microdata  = true            # POPULATION total == P_T alloc
 population_relative_tolerance  = 1e-6            # accumulated in Float64, stored as Float32
 
 # ==============================================================================
-# STAGE 4 — BENCHMARKING (not implemented yet: only its output folder is declared)
+# STAGE 4 — BENCHMARKING
+# Compares the population surfaces with the census at four scales: tract, district,
+# municipality and state. The result is for the whole run (all selected UFs together).
+#
+#   * tracts, districts and municipalities are each summed over their OWN polygons;
+#   * a state is the sum of its municipalities (the 2022 database has no state layer);
+#   * a raster cell belongs to the polygon that contains its centre (stages/zonal.py);
+#   * the census total of a unit is the sum of its tracts' microdata (code prefix).
+# Tract polygons and the microdata come from [enrichment.<year>].
+#
+# Columns written per product `<key>`: pi_sum_<key>, pi_count_<key> (cells counted),
+# err_<key> and pct_err_<key> (against the census).
 # ==============================================================================
 [benchmarking]
-output_dir = "/mnt/hdd3/brazilpop/{year}/benchmarks"      # Stage 4 will write here; it will read Stage 3 from [rasterization] output_dir
+output_dir      = "/mnt/hdd3/brazilpop/{year}/benchmarks"      # Stage 4 writes here; it reads Stage 3 from [rasterization] output_dir
+scales          = ["tract", "district", "municipality", "state"]
+workers         = 8                       # worker processes sampling raster windows (about 1 GB each)
+window_cells    = 50000000               # raster cells per window (memory against speed)
+master_pattern  = "benchmark_{year}_tracts.gpkg"      # one polygon per tract with every column
+table_pattern   = "benchmark_{year}_{scale}.csv"      # one table per scale
+metrics_pattern = "benchmark_{year}_metrics.csv"      # bias, MAE, RMSE, MAPE and totals per product and scale
+report_pattern  = "benchmark_{year}_report.json"
+
+# District and municipality polygons per census year, in YOUR file naming and columns.
+# `<scale>_name_column` is optional (a readable name in the tables).
+[benchmarking.2022]
+district_path            = "/mnt/hdd1/brazilpop/raw/census/IBGE_CENSO-2022_BD_BRASIL_2022.gpkg"
+district_layer           = "distritos"
+district_code_column     = "distrito_code"
+district_name_column     = "distrito_name"
+municipality_path        = "/mnt/hdd1/brazilpop/raw/census/IBGE_CENSO-2022_BD_BRASIL_2022.gpkg"
+municipality_layer       = "municipios"
+municipality_code_column = "municipio_code"
+municipality_name_column = "municipio_name"
+
+[benchmarking.2010]
+district_path            = "/mnt/hdd1/brazilpop/raw/census/IBGE_CENSO-2010_BD_BRASIL_2010.gpkg"
+district_layer           = "distritos"
+district_code_column     = "distrito_code"
+district_name_column     = "distrito_name"
+municipality_path        = "/mnt/hdd1/brazilpop/raw/census/IBGE_CENSO-2010_BD_BRASIL_2010.gpkg"
+municipality_layer       = "municipios"
+municipality_code_column = "code"
+municipality_name_column = "name"
+
+# Products. The key becomes the column suffix: pi_sum_brazilpop, pi_sum_landscan, ...
+# `label`: the name shown in charts (optional, default: the key). `min_scale`: the product
+# enters the accuracy metrics from this scale up (a coarse raster is not fairly evaluated on
+# small units). `years`: census years it applies to (optional).
+#
+# BrazilPop is read from the Stage 3 population rasters. `stage3_resolution` is used at every
+# scale, except the ones listed in `resolution_by_scale`: here tracts are sampled from the
+# 30 m raster (a quality check) and the larger units from the 100 m raster.
+[benchmarking.products.brazilpop]
+label             = "BrazilPop"
+stage3_resolution = "01C"
+min_scale         = "tract"
+
+[benchmarking.products.brazilpop.resolution_by_scale]
+tract = "030"
+
+# External rasters: a full path (may use {year}). EPSG:4326, one band, NoData declared.
+# Add one block per benchmark; nothing else changes.
+[benchmarking.products.landscan]
+label     = "LandScan"
+raster    = "/media/ipo/Feynman/planalto/ZENODO/BRAZILPOP/V500/T1/ASSETS/BCMK/LANDSCAN_BRAZIL_{year}.tif"
+min_scale = "municipality"
+years     = [2022]
+
+[benchmarking.products.worldpop]
+label     = "WorldPop"
+raster    = "/media/ipo/Feynman/planalto/ZENODO/BRAZILPOP/V500/T1/ASSETS/BCMK/WORLDPOP_BRAZIL_{year}.tif"
+min_scale = "municipality"
+years     = [2022]
+
+# The GHSL epoch is 2020 while the census is 2022: the path has no {year} and the label says so.
+[benchmarking.products.ghsl]
+label     = "GHSL (2020)"
+raster    = "/media/ipo/Feynman/planalto/ZENODO/BRAZILPOP/V500/T1/ASSETS/BCMK/GHSL_BRAZIL_2020.tif"
+min_scale = "municipality"
+years     = [2022]

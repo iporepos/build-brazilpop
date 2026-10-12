@@ -42,7 +42,7 @@ def read_cells(path: Path) -> dict[tuple[int, int], float]:
 
 
 def make_cfg(tmp_path: Path, *, nodata: int = 65535, epsg: int = 4326, template_type: str = "UInt16",
-             template_nodata: int | None = None, template_bands: int = 1, extra_points: int = 0,
+             template_nodata: int | None = 65535, template_bands: int = 1, extra_points: int = 0,
              layer: str = "addresses") -> dict:
     tpl = tmp_path / "tpl.tif"
     cmd = ["gdal_create", "-q", "-outsize", "4", "3", "-ot", template_type, "-burn", "0", "-bands", str(template_bands),
@@ -150,8 +150,8 @@ def test_output_encoding_and_sidecar(built):
     info = json.loads(subprocess.run(["gdalinfo", "-json", str(f)], capture_output=True, text=True).stdout)
     band = info["bands"][0]
     assert band["type"] == "UInt16" and band["noDataValue"] == 65535
-    assert info["metadata"]["IMAGE_STRUCTURE"]["LAYOUT"] == "COG"
-    assert info["metadata"]["IMAGE_STRUCTURE"]["COMPRESSION"] == "ZSTD"
+    assert info["size"] == [4, 3]                        # a copy of the template: its own layout
+    assert not f.with_name(f.stem + ".part.tif").exists()
     pinfo = json.loads(subprocess.run(["gdalinfo", "-json", str(raster(cfg, "POPULATION_RESIDENT"))],
                                       capture_output=True, text=True).stdout)
     assert pinfo["bands"][0]["type"] == "Float32" and pinfo["bands"][0]["noDataValue"] == -9999
@@ -180,11 +180,12 @@ def test_manifest_lists_every_layer(built):
     assert rep["rasters"] == 6
 
 
-def test_counts_are_clipped_not_wrapped_at_the_ceiling(tmp_path):
-    cfg = make_cfg(tmp_path, nodata=3)                  # max valid count = 2; cell (2,1) holds 3 points
+def test_saturated_counts_stop_at_the_type_maximum_and_are_reported(tmp_path):
+    cfg = make_cfg(tmp_path, extra_points=70000)        # 70,000 points in one UInt16 cell
     rep = run(cfg, 2022, ["DF"])
-    assert read_cells(raster(cfg, "CNEFE_ADDRESS-00"))[(2, 1)] == 2
-    assert any(r["clipped"] for r in rep["layers"] if r["layer"] == "CNEFE_ADDRESS-00")
+    assert read_cells(raster(cfg, "CNEFE_ADDRESS-00"))[(3, 2)] == 65535       # stops, never wraps to 4464
+    layer = next(r for r in rep["layers"] if r["layer"] == "CNEFE_ADDRESS-00")
+    assert layer["saturated"] and layer["maximum"] == 65535
 
 
 def test_population_burn_reads_only_points_with_weight():
@@ -219,29 +220,34 @@ def test_a_bad_template_is_reported_even_when_other_problems_exist(tmp_path):
     assert any("not found" in p for p in problems) and any("EPSG:4326" in p for p in problems)
 
 
-@pytest.mark.parametrize("kind", [
-    {"template_nodata": 255},
-    {"template_bands": 3},
-    {"template_nodata": 255, "template_bands": 2},
-], ids=["nodata-255", "3-bands", "nodata-and-bands"])
-def test_uint16_template_nodata_and_bands_are_not_inherited(tmp_path, kind):
-    """The template only supplies the grid. A cell holding exactly the template's NoData
-    value (255 points here) must still be counted, and the output must be one band."""
-    cfg = make_cfg(tmp_path, extra_points=255, **kind)
+@pytest.mark.parametrize("kind, message", [
+    ({"template_nodata": 255}, "has NoData 255"),
+    ({"template_bands": 3}, "exactly one"),
+], ids=["wrong-nodata", "3-bands"])
+def test_template_is_the_output_so_it_must_be_one_band_with_the_configured_nodata(tmp_path, kind, message):
+    cfg = make_cfg(tmp_path, **kind)
+    with pytest.raises(ConfigError, match=message):
+        run(cfg, 2022, ["DF"])
+
+
+def test_template_with_the_configured_nodata_is_kept_and_counts_are_exact(tmp_path):
+    cfg = make_cfg(tmp_path, template_nodata=65535, extra_points=255)
     rep = run(cfg, 2022, ["DF"])
-
-    a00 = read_cells(raster(cfg, "CNEFE_ADDRESS-00"))
-    assert a00[(3, 2)] == 255                                   # not swallowed as NoData
+    assert read_cells(raster(cfg, "CNEFE_ADDRESS-00"))[(3, 2)] == 255
     layer = next(r for r in rep["layers"] if r["layer"] == "CNEFE_ADDRESS-00")
-    assert layer["total"] == 7 + 255 and layer["maximum"] == 255
-    pop = next(r for r in rep["layers"] if r["layer"] == "POPULATION_RESIDENT")
-    assert pop["total"] == pytest.approx(45.0 + 25.5, rel=1e-6)
+    assert layer["total"] == 7 + 255 and not layer["saturated"]
+    info = json.loads(subprocess.run(["gdalinfo", "-json", str(raster(cfg, "POPULATION_RESIDENT"))],
+                                     capture_output=True, text=True).stdout)
+    assert info["bands"][0]["type"] == "Float32" and info["bands"][0]["noDataValue"] == -9999
 
-    for name, dtype, nd in (("CNEFE_ADDRESS-00", "UInt16", 65535), ("POPULATION_RESIDENT", "Float32", -9999)):
-        info = json.loads(subprocess.run(["gdalinfo", "-json", str(raster(cfg, name))],
-                                         capture_output=True, text=True).stdout)
-        assert len(info["bands"]) == 1
-        assert info["bands"][0]["type"] == dtype and info["bands"][0]["noDataValue"] == nd
+
+def test_a_template_that_is_not_blank_is_refused(tmp_path):
+    cfg = make_cfg(tmp_path)
+    subprocess.run(["gdal_rasterize", "-q", "-burn", "7", "-where", "p_i = 10",
+                    str(Path(cfg["enrichment"]["output_dir"]) / "cnefe_2022_DF_enriched.gpkg"), cfg["resolutions"]["030"]["template"]],
+                   check=True)
+    with pytest.raises(ConfigError, match="not blank"):
+        run(cfg, 2022, ["DF"])
 
 
 def test_stage3_reads_the_enriched_layer_name_from_the_config(tmp_path):
@@ -269,3 +275,42 @@ def test_catalog_code_must_be_in_dictionary(tmp_path):
         {"variable": "CNEFE", "variant": "ADDRESS", "spec": "09", "class": "count", "species": [9]})
     with pytest.raises(ConfigError, match="species 9"):
         build_catalog(cfg, 2022)
+
+
+def _allocated(path: Path) -> int:
+    return path.stat().st_blocks * 512
+
+
+def test_two_ufs_are_added_into_the_same_raster(tmp_path):
+    cfg = make_cfg(tmp_path)
+    cfg["ufs"]["RO"] = 11
+    enriched = Path(cfg["enrichment"]["output_dir"])
+    shutil.copy(enriched / "cnefe_2022_DF_enriched.gpkg", enriched / "cnefe_2022_RO_enriched.gpkg")
+    shutil.copy(enriched / "cnefe_2022_DF_stage2_report.json", enriched / "cnefe_2022_RO_stage2_report.json")
+    run(cfg, 2022, ["DF", "RO"])
+    assert read_cells(raster(cfg, "CNEFE_ADDRESS-00"))[(0, 0)] == 6                       # 3 + 3
+
+def test_nonzero_fill_value_is_rejected_at_startup(tmp_path):
+    cfg = make_cfg(tmp_path)
+    cfg["rasterization"]["encoding"]["counts"]["fill_value"] = 5
+    assert any("fill_value must be 0" in p for p in validate(cfg, 2022, ["DF"]))
+
+
+def test_write_cog_rewrites_the_rasters_as_cloud_optimized_geotiffs(tmp_path):
+    cfg = make_cfg(tmp_path)
+    cfg["rasterization"]["geotiff_profile"]["write_cog"] = True
+    run(cfg, 2022, ["DF"])
+    f = raster(cfg, "CNEFE_ADDRESS-00")
+    info = json.loads(subprocess.run(["gdalinfo", "-json", str(f)], capture_output=True, text=True).stdout)
+    assert info["metadata"]["IMAGE_STRUCTURE"]["LAYOUT"] == "COG"
+    assert info["metadata"]["IMAGE_STRUCTURE"]["COMPRESSION"] == "ZSTD"
+    assert read_cells(f)[(0, 0)] == 3
+
+
+def test_progress_is_logged_per_uf(tmp_path, caplog):
+    import logging
+    cfg = make_cfg(tmp_path)
+    with caplog.at_level(logging.INFO, logger="stage_03"):
+        run(cfg, 2022, ["DF"])
+    text = caplog.text
+    assert "[ 1/1] DF burning" in text and "[ 1/1] DF done" in text and "rasters finished]" in text

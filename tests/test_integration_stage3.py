@@ -53,11 +53,10 @@ def test_consistency_checks_hold(result):
     assert not failed, failed
 
 
-def test_outputs_are_cogs_on_the_template_grid(result):
+def test_outputs_are_on_the_template_grid(result):
     cfg, rep = result
     for row in rep["layers"]:
         info = json.loads(subprocess.run(["gdalinfo", "-json", row["file"]], capture_output=True, text=True).stdout)
         tpl = json.loads(subprocess.run(["gdalinfo", "-json", cfg["resolutions"][row["resolution"]]["template"]],
                                         capture_output=True, text=True).stdout)
-        assert info["metadata"]["IMAGE_STRUCTURE"]["LAYOUT"] == "COG"
         assert info["size"] == tpl["size"] and info["geoTransform"] == tpl["geoTransform"]

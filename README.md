@@ -22,14 +22,14 @@ Stage 2  Vector enrichment & weight allocation (point-in-polygon)
         |
         v
 Stage 3  Direct additive rasterization (30 m, 100 m, 1 km)
-         -> final rasters (COG)           data/04_rasters/
+         -> final rasters (GeoTIFF)       data/04_rasters/
         |
         v
 Stage 4  Multi-scale benchmarking
-         -> benchmark tables & tract layer   benchmarks/
+         -> benchmark tables, metrics & tract layer   benchmarks/
 ```
 
-Each stage is a script of its own and reads only the output of the previous one, so any stage can be re-run alone. Stages 1 to 3 are implemented; an orchestrator that chains them is planned.
+Each stage is a script of its own and reads only the output of the previous one, so any stage can be re-run alone. Stages 1 to 4 are implemented; an orchestrator that chains them is planned.
 
 ---
 
@@ -102,7 +102,7 @@ One raster per resolution (`030`, `01C`, `01K`), declared by full path as `templ
 
 ### 5. External products (benchmark only)
 
-WorldPop, Meta HRSL, GHS-POP and LandScan rasters, clipped or tiled per UF. Their paths will be declared in the benchmarking block when Stage 4 is implemented (it is not yet). These are used only by Stage 4, Branch B.
+WorldPop, Meta HRSL, GHS-POP and LandScan rasters. Each is declared by full path as `raster` under `[benchmarking.products.<name>]` (the path may use `{year}`). They are national rasters in EPSG:4326, one band, with NoData declared. They are used only by Stage 4, Branch B. LandScan is an *ambient* (daytime-averaged) population, not residents, so part of its difference from the census is structural.
 
 ---
 
@@ -193,7 +193,7 @@ The checks compare totals within one resolution. They are written to the Stage 3
 
 ### Raster specifications
 
-UInt16 reserves 65535 for NoData, so the largest valid count per cell is 65534. Counts are accumulated in UInt32, so they can never wrap, and population in Float64 so it does not drift; both are converted once at the end. Stage 3 checks the maximum of every count raster and, if any cell exceeds the ceiling, clips it to 65534 and logs a warning. The 1 km grid is the only one where this could plausibly matter.
+UInt16 reserves 65535 for NoData, so the largest valid count per cell is 65534. Counts are burned directly into the UInt16 raster, as the legacy script did. GDAL's `-add` stops at the type's maximum (it does not wrap), so a cell holding more than 65,534 points reads 65535 (the NoData value) and the excess is lost. Stage 3 reads every count raster once, with NoData switched off, and logs a warning and sets `saturated` in the manifest if any cell reached 65535. The 1 km grid is the only one where this could plausibly matter.
 
 | | Address and household | Population |
 |---|---|---|
@@ -320,36 +320,54 @@ Per raster: the `.qml` style (see above). Overviews are optional and off by defa
 
 ### Stage 3: report and manifest
 
-`{output_dir}/manifest_{year}.csv` has one row per raster (layer, status, total, maximum, whether it was clipped, file). `{output_dir}/stage3_report_{year}.json` adds the consistency checks with expected and actual values.
+`{output_dir}/manifest_{year}.csv` has one row per raster (layer, status, total, maximum, whether it saturated, file). `{output_dir}/stage3_report_{year}.json` adds the consistency checks with expected and actual values.
 
-Rasterization uses GDAL: `gdal_create` builds a zeroed raster on the template's grid, `gdal_rasterize -add` burns the points of every selected UF (counts burn 1, population burns `p_i`), and `gdal_translate` writes the final COG. All UFs of a run are burned into the same rasters, so run every UF you want in one invocation.
+Rasterization is a close port of the legacy script and uses GDAL only. For every resolution and layer: the blank UInt16 template is **copied** to the output name (population: a compressed Float32 raster is created on the same grid), then `gdal_rasterize -add` burns the points of **one UF at a time** straight into it, in a loop (counts burn 1, population burns `p_i`). The log shows every UF (`[ 3/27] PA burning` / `done in 108s`) and a running estimate of the time left. There are no work copies, so disk use is the template size plus a little (a 30 m national count raster stays in the tens of MB; measured: +16 MB per large UF). The raster is written under `.part.tif` and renamed when complete. Stage 3 requires each template to be blank, one band, with NoData 65535 or none. Optional `[rasterization.geotiff_profile] write_cog = true` rewrites each finished raster as a COG. All UFs of a run go into the same rasters, so run every UF you want in one invocation.
 
 ### Stage 4: benchmark dataset
 
-Written to `benchmarks/`.
+Written to `[benchmarking] output_dir`. **The result is for the whole run (all selected UFs together), not one file per UF**; the UF option is mostly for testing.
 
-`benchmark_{year}_{uf}_tracts.gpkg` is the **master benchmark layer**. It has one polygon per census tract, so the errors can be mapped and inspected in QGIS. It holds:
+**Method.** For each scale and each product, the cells of the product's raster are added up per polygon and compared with the census total of the same unit.
 
-| Column group | Columns |
-|--------------|---------|
-| IDs | tract, district, municipality and state codes |
-| Ground truth | `P_T`, `H_T` |
-| This product | zonal sums from the 30 m, 100 m and 1 km population rasters |
-| External products | zonal sums from WorldPop, HRSL, GHS-POP, LandScan |
-| Errors | absolute and percentage error per product |
+- Tracts, districts and municipalities are each summed over their **own polygons** (tracts from `[enrichment.<year>]`, districts and municipalities from `[benchmarking.<year>]`). A **state is the sum of its municipalities**, because the 2022 database has no state layer.
+- **A cell belongs to the polygon that contains its centre.** This is applied with GDAL (`gdal_rasterize` burns polygon ids on a grid that is the raster window cell for cell, numpy adds the values per id), so a cell is never split and never counted twice, and the sum over the polygons cannot exceed the raster total. NoData cells are skipped. Windows with no polygon are skipped, and windows run in parallel.
+- The census total `P_K` (and `H_K`) of a unit is the sum of the tract microdata over its code prefix: district = first 9 digits, municipality = first 7, state = first 2.
+- BrazilPop is read from the Stage 3 population rasters. `stage3_resolution` is used at every scale except those in `resolution_by_scale`; the default configuration samples **tracts at 30 m (a quality check) and the larger units at 100 m**. The resolution used at each scale is written in the metrics.
+- A polygon smaller than a cell can contain no cell centre and then gets 0 even though it has population. That is the reason for `min_scale` per product, and the number of such units is reported (`units_without_cells`).
 
-Tables per scale (tract, district, municipality, state) are written as CSV and Parquet:
+**Columns**, per product `<key>` (the key of `[benchmarking.products.<key>]`): `pi_sum_<key>` (sum of the cell values), `pi_count_<key>` (cells counted), `err_<key>` (`pi_sum - P_K`) and `pct_err_<key>`.
 
-`benchmark_{year}_{uf}_{scale}.csv`
+| File | Content |
+|------|---------|
+| `benchmark_{year}_tracts.gpkg` (layer `tracts`) | **Master layer**: one polygon per tract with `tract_code`, `district_code`, `municipality_code`, `uf_code`, `p_k`, `h_k`, `n_tracts` and every product column, so the errors can be mapped in QGIS |
+| `benchmark_{year}_{scale}.csv` | One table per scale (`tract`, `district`, `municipality`, `state`): `code`, `name`, `p_k`, `h_k`, `n_tracts` and every product column |
+| `benchmark_{year}_metrics.csv` | One row per scale and product (see below) |
+| `benchmark_{year}_report.json` | Inputs, polygon counts, the census total, per raster the total inside the polygons, windows read and skipped, time, and the census units that have no polygon |
 
-with the same column groups aggregated to that scale.
+**Metrics**, over the units that have a census total, with `e = pi_sum - P_K`:
 
-`benchmark_{year}_{uf}_metrics.csv` gives bias, MAE, RMSE and MAPE per product and scale.
+| Column | Definition |
+|--------|------------|
+| `units`, `units_with_population` | units compared, and those with `P_K > 0` |
+| `bias` | mean of `e` |
+| `mae`, `rmse` | mean of `|e|`, square root of the mean of `e²` |
+| `mape` | mean of `|e| / P_K` in percent, over units with `P_K > 0` |
+| `total_pred`, `total_truth`, `mass_gap`, `ratio` | sums, their difference and quotient |
+| `units_without_cells` | units with `P_K > 0` and no cell centre |
+
+A product enters the metrics of a scale from its `min_scale` up (its columns are still written at every scale).
 
 Two branches use these tables:
 
-- **Branch A, validation against ground truth.** BrazilPop zonal sums against official `P_K` at every scale. This measures boundary discretization error, which should shrink toward zero from tract to state.
-- **Branch B, inter-product comparison.** External products against `P_K`, each only at scales where its native resolution gives enough pixels per unit (100 m products from district level up, LandScan from municipality level up).
+- **Branch A, validation against ground truth.** BrazilPop against official `P_K` at every scale. This measures boundary discretization error, which shrinks from tract to state.
+- **Branch B, inter-product comparison.** External products against `P_K`, each only at scales where its native resolution gives enough pixels per unit (LandScan and WorldPop from municipality level up).
+
+**Adding a benchmark** is one block under `[benchmarking.products.<key>]` (`raster`, `min_scale`, optional `label` and `years`); nothing else changes. Its columns appear in every table, the master layer and the metrics, and in the charts.
+
+**Quick look.** `tools/plot_benchmark.py --config <config> --year <year>` reads the Stage 4 tables and writes two PNGs next to them (`plots/`): a scatter of census against estimate per tract, one panel per product, and bars of MAPE, MAE, RMSE and bias grouped by scale (value axes are logarithmic with ticks in scientific notation, every bar carries its value in plain figures). BrazilPop is drawn in one accent blue and every benchmark in one dark gray (`--accent` changes which product is the accent), so there is no rainbow and any number of benchmarks fits. Because colour does not tell the benchmarks apart, each bar is named under it, with the scale as the group label, and each scatter panel is titled with its product. It needs matplotlib (`requirements.txt`).
+
+**Cost (timed on the whole of Brazil with national rasters of the previous product version, 24 cores, NVMe scratch, 16 workers).** About 6.5 minutes for four products at three polygon scales: 258 s for the 22.6-billion-cell 30 m raster, 24 s for BrazilPop 100 m, 28 s for LandScan, 33 s for WorldPop. Peak memory of the parent process 5.7 GB, about 1 GB per worker.
 
 ---
 
@@ -387,11 +405,12 @@ Each census vintage has its own `[ingestion.<year>]` block pointing to its adapt
 python -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python -m pytest tests                              # unit + integration tests
 
-# Stages 1 to 3 are implemented; each runs alone and needs the previous stage's output.
-# Stage 3 needs the GDAL command-line tools; run all the UFs you want in one call.
+# Stages 1 to 4 are implemented; each runs alone and needs the previous stage's output.
+# Stages 3 and 4 need the GDAL command-line tools; run all the UFs you want in one call.
 .venv/bin/python stages/stage_01_ingest_manager.py --config config.local.toml --uf RS
 .venv/bin/python stages/stage_02_vector_enrichment.py --config config.local.toml --uf RS
 .venv/bin/python stages/stage_03_additive_rasterize.py --config config.local.toml --uf RS
+.venv/bin/python stages/stage_04_benchmark.py --config config.local.toml --year 2022   # whole run, not per UF
 
 # Planned (not written yet): an orchestrator that runs the stages in order
 # python run_pipeline.py --config config.local.toml --uf RS

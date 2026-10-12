@@ -1,19 +1,22 @@
-"""Stage 3: direct additive rasterization with GDAL.
+"""Stage 3: direct additive rasterization with GDAL, in the manner of the legacy script.
 
     python stages/stage_03_additive_rasterize.py --config config.local.toml
     python stages/stage_03_additive_rasterize.py --config config.local.toml --year 2022 --uf DF --uf RS
 
 For every resolution and every layer of the year's catalog:
 
-  1. gdal_create builds a zeroed raster on the grid of the resolution's template
-  2. gdal_rasterize -add burns the enriched points of every selected UF into it
+  1. the template (a blank UInt16 raster) is copied to the output name; for the population
+     layer a compressed Float32 raster is created on the same grid;
+  2. `gdal_rasterize -add` burns the enriched points of ONE UF at a time straight into it,
+     in a loop, so every UF is a visible step in the log:
        counts      burn 1 per point matching the layer filter
-       population  burn p_i, reading only the points with p_i > 0
-  3. gdal_translate writes the final COG (and the QML style sidecar is copied)
+       population  burn p_i of the points that carry weight
+  3. totals and the saturation check read the raster once; the QML style is copied.
 
-Each resolution is rasterized on its own; nothing is resampled and the
-resolutions are never compared with each other. All UFs of a run are burned into
-the same rasters, so run every UF you want in one invocation.
+There are no work copies and no conversion unless `write_cog` is set. Each resolution is
+rasterized on its own; nothing is resampled and the resolutions are never compared with
+each other. All UFs of a run are burned into the same rasters, so run every UF you want in
+one invocation.
 """
 
 from __future__ import annotations
@@ -28,7 +31,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -59,37 +62,6 @@ def _info(path: Path, stats: bool = False) -> dict:
 
 def _epsg(info: dict) -> int | None:
     return info.get("stac", {}).get("proj:epsg")
-
-
-def raster_total(path: Path) -> tuple[float, float]:
-    """(sum of all cell values, maximum) of a raster without NoData cells."""
-    info = _info(path, stats=True)
-    band = info["bands"][0]
-    w, h = info["size"]
-    # The JSON "mean" is rounded; the metadata string keeps full precision.
-    md = band.get("metadata", {}).get("", {})
-    mean = float(md.get("STATISTICS_MEAN", band["mean"]))
-    maximum = float(md.get("STATISTICS_MAXIMUM", band["maximum"]))
-    return mean * w * h, maximum
-
-
-def _clip_counts(work: Path, ceiling: int) -> Path:
-    """Return a copy of a UInt32 count raster with every cell clipped to `ceiling`.
-
-    GDAL's gdal_translate -scale does not clamp, so the (rare) clipping is done
-    on the raw ENVI export, in place and by memory map.
-    """
-    import numpy as np
-
-    raw = work.with_suffix(".clip.bin")
-    _run(["gdal_translate", "-q", "-of", "ENVI", str(work), str(raw)])
-    hdr = raw.with_suffix(".hdr").read_text()
-    order = ">" if "byte order = 1" in hdr else "<"
-    cells = np.memmap(raw, dtype=np.dtype(f"{order}u4"), mode="r+")
-    np.minimum(cells, ceiling, out=cells)
-    cells.flush()
-    del cells
-    return raw
 
 
 # ---------------------------------------------------------------------------- catalog
@@ -213,6 +185,8 @@ def validate(cfg: dict, year: int, ufs: list[str]) -> list[str]:
             problems.append(f"catalog layer {e.get('variant')}: source '{e['source']}' is not the address "
                             f"population column [enrichment].out_p_i = '{p_i}'")
     for key in ("counts", "population"):
+        if r.get("encoding", {}).get(key, {}).get("fill_value", 0) != 0:
+            problems.append(f"[rasterization.encoding.{key}] fill_value must be 0 (the work rasters are sparse)")
         if r.get("encoding", {}).get(key, {}).get("dtype") not in GDAL_TYPES:
             problems.append(f"[rasterization.encoding.{key}] dtype must be one of {sorted(GDAL_TYPES)}")
     for res in r.get("resolutions", []):
@@ -229,6 +203,54 @@ def validate(cfg: dict, year: int, ufs: list[str]) -> list[str]:
 
 # ------------------------------------------------------------------------------ build
 
+def raster_stats(path: Path, tmp_dir: Path) -> tuple[float, float]:
+    """(sum of all cells, maximum), with the NoData value switched OFF.
+
+    A saturated count (65535) is the NoData value, so ordinary statistics would skip it and
+    hide the saturation. A throw-away VRT that carries no NoData sees every cell.
+    """
+    vrt = tmp_dir / f"{path.stem}.nodata_off.vrt"
+    _run(["gdal_translate", "-q", "-of", "VRT", "-a_nodata", "none", str(path), str(vrt)])
+    try:
+        info = _info(vrt, stats=True)
+    finally:
+        vrt.unlink(missing_ok=True)
+        Path(str(vrt) + ".aux.xml").unlink(missing_ok=True)
+    band = info["bands"][0]
+    md = band.get("metadata", {}).get("", {})
+    w, h = info["size"]
+    mean = float(md.get("STATISTICS_MEAN", band["mean"]))
+    return mean * w * h, float(md.get("STATISTICS_MAXIMUM", band["maximum"]))
+
+
+def check_template(res: str, template: Path, nodata: int, tmp_dir: Path) -> None:
+    """The template IS the output raster, so it must be blank and carry the config NoData."""
+    info = _info(template)
+    if len(info["bands"]) != 1:
+        raise ConfigError(f"template for {res} has {len(info['bands'])} bands; it must have exactly one: {template}")
+    found = info["bands"][0].get("noDataValue")
+    if found is not None and found != nodata:
+        raise ConfigError(f"template for {res} has NoData {found}; it must be {nodata} (as in "
+                          f"[rasterization.encoding.counts]) or none: the output is a copy of it: {template}")
+    _total, maximum = raster_stats(template, tmp_dir)
+    if maximum != 0:
+        raise ConfigError(f"template for {res} is not blank (largest cell {maximum:g}): points would be "
+                          f"added on top of its values: {template}")
+
+
+def prepare_raster(cfg: dict, res: str, is_float: bool, target: Path) -> None:
+    """Counts: a copy of the template. Population: a compressed Float32 raster on its grid."""
+    template = Path(cfg["resolutions"][res]["template"])
+    if not is_float:
+        shutil.copyfile(template, target)
+        return
+    enc = cfg["rasterization"]["encoding"]["population"]
+    _run(["gdal_create", "-q", "-if", str(template), "-bands", "1", "-ot", GDAL_TYPES[enc["dtype"]],
+          "-burn", str(enc.get("fill_value", 0)), "-a_nodata", str(enc["nodata"]),
+          "-co", "TILED=YES", "-co", "COMPRESS=ZSTD", "-co", "ZSTD_LEVEL=1", "-co", "PREDICTOR=3",
+          "-co", "BIGTIFF=YES", str(target)])
+
+
 def build_raster(cfg: dict, year: int, ufs: list[str], res: str, lay: Layer, work_dir: Path,
                  overwrite: bool) -> dict:
     t0 = time.time()
@@ -237,70 +259,67 @@ def build_raster(cfg: dict, year: int, ufs: list[str], res: str, lay: Layer, wor
     prof = r["geotiff_profile"]
     final_type = GDAL_TYPES[enc["dtype"]]
     is_float = final_type.startswith("Float")
+    tag = f"{res} {lay.key:<24}"
 
     final = out_dir(cfg, res, year) / raster_name(cfg, lay, res, year)
     final.parent.mkdir(parents=True, exist_ok=True)
     if final.exists() and not overwrite:
         raise FileExistsError(f"{final} exists (set execution.overwrite = true to replace)")
 
-    work = work_dir / f"{res}_{lay.key}.tif"
-    # Wide working type: counts cannot wrap (UInt32) and population does not drift (Float64).
-    work_type = "Float64" if is_float else "UInt32"
-    # The template only supplies the grid. Whatever else it carries is NOT inherited:
-    #   -bands 1    one band, even if the template has several (e.g. an RGB Byte raster);
-    #   -a_nodata   an explicit value that a cell can never hold. Without it the work raster
-    #               inherits the template's NoData (255 for a Byte template), and a cell that
-    #               holds exactly that count would be invisible to the statistics, the
-    #               consistency checks and the saturation test.
-    sentinel = str(enc["nodata"]) if is_float else str(2 ** 32 - 1)
-    _run(["gdal_create", "-q", "-if", cfg["resolutions"][res]["template"], "-bands", "1", "-ot", work_type,
-          "-burn", str(enc.get("fill_value", 0)), "-a_nodata", sentinel, "-co", "TILED=YES",
-          "-co", "SPARSE_OK=TRUE", "-co", "BIGTIFF=IF_SAFER", str(work)])
+    # The raster is built under a temporary name and renamed when complete, so an interrupted
+    # run never leaves a half-burned file under the final name.
+    tmp = final.with_name(final.stem + ".part.tif")
+    tmp.unlink(missing_ok=True)
+    log.info("%s preparing the raster (%s)", tag, "new Float32 on the template grid" if is_float else "copy of the template")
+    prepare_raster(cfg, res, is_float, tmp)
 
     where = lay.where()
-    for uf in ufs:
-        cmd = ["gdal_rasterize", "-q", "-add", "-l", layer_name(cfg, "enrichment", year, uf)]
-        cmd += ["-a", lay.source] if lay.source else ["-burn", "1"]
-        if where:
-            cmd += ["-where", where]
-        _run(cmd + [str(enriched_path(cfg, year, uf)), str(work)])
-
-    total, maximum = raster_total(work)
-    if not is_float:
-        total = float(round(total))          # integer counts: drop floating-point noise from the mean
-    ceiling = int(enc["nodata"]) - 1 if not is_float else None
-    clipped = bool(ceiling is not None and maximum > ceiling)
-    if clipped and enc.get("warn_on_saturation", True):
-        log.warning("%s %s: maximum %d exceeds %d; clipped to the ceiling", res, lay.key, maximum, ceiling)
-
-    source = work
-    if clipped:
-        source = _clip_counts(work, ceiling)
-    tmp = final.with_name(final.stem + ".tmp.tif")
-    cmd = ["gdal_translate", "-q", "-of", "COG", "-ot", final_type, "-a_nodata", str(enc["nodata"])]
-    cmd += ["-co", f"COMPRESS={prof.get('compress', 'ZSTD')}",
-            "-co", f"PREDICTOR={prof['predictor_float'] if is_float else prof['predictor_integer']}",
-            "-co", f"BLOCKSIZE={prof.get('blocksize', 512)}", "-co", "BIGTIFF=IF_SAFER"]
-    if prof.get("build_overviews"):
-        cmd += ["-co", f"OVERVIEW_RESAMPLING={prof.get('overview_resampling', 'AVERAGE')}"]
-    else:
-        cmd += ["-co", "OVERVIEWS=NONE"]
     try:
-        _run(cmd + [str(source), str(tmp)])
+        for i, uf in enumerate(ufs, 1):
+            t_uf = time.time()
+            log.info("%s [%2d/%d] %s burning", tag, i, len(ufs), uf)
+            cmd = ["gdal_rasterize", "-q", "-add", "-l", layer_name(cfg, "enrichment", year, uf)]
+            cmd += ["-a", lay.source] if lay.source else ["-burn", "1"]
+            if where:
+                cmd += ["-where", where]
+            _run(cmd + [str(enriched_path(cfg, year, uf)), str(tmp)])
+            log.info("%s [%2d/%d] %s done in %.0fs", tag, i, len(ufs), uf, time.time() - t_uf)
+
+        log.info("%s reading the raster once for the totals", tag)
+        total, maximum = raster_stats(tmp, work_dir)
+        if not is_float:
+            total = float(round(total))          # integer counts: drop floating-point noise from the mean
+        ceiling = {"UInt8": 255, "Byte": 255, "UInt16": 65535, "UInt32": 4294967295}.get(final_type)
+        saturated = bool(not is_float and ceiling is not None and maximum >= ceiling)
+        if saturated and enc.get("warn_on_saturation", True):
+            log.warning("%s a cell reached %d: counts saturate there and are lost (adds stop at the "
+                        "type's maximum)", tag, ceiling)
+
+        if prof.get("write_cog"):
+            log.info("%s writing the Cloud Optimized GeoTIFF", tag)
+            cog = final.with_name(final.stem + ".cog.tif")
+            cmd = ["gdal_translate", "-q", "-of", "COG", "-ot", final_type,
+                   "-co", f"COMPRESS={prof.get('compress', 'ZSTD')}",
+                   "-co", f"PREDICTOR={prof['predictor_float'] if is_float else prof['predictor_integer']}",
+                   "-co", f"BLOCKSIZE={prof.get('blocksize', 512)}", "-co", "BIGTIFF=IF_SAFER",
+                   "-co", "NUM_THREADS=ALL_CPUS"]
+            cmd += (["-co", f"OVERVIEW_RESAMPLING={prof.get('overview_resampling', 'AVERAGE')}"]
+                    if prof.get("build_overviews") else ["-co", "OVERVIEWS=NONE"])
+            try:
+                _run(cmd + [str(tmp), str(cog)])
+                os.replace(cog, tmp)
+            finally:
+                cog.unlink(missing_ok=True)
         os.replace(tmp, final)
     finally:
         tmp.unlink(missing_ok=True)
-        work.unlink(missing_ok=True)
-        if source != work:
-            for f in (source, source.with_suffix(".hdr"), Path(str(source) + ".aux.xml")):
-                f.unlink(missing_ok=True)
 
     shutil.copyfile(style_file(cfg, lay, res), final.with_suffix(".qml"))
-    log.info("%s %-28s total %s  max %s%s", res, lay.key, f"{total:,.0f}", f"{maximum:,.0f}",
-             "  CLIPPED" if clipped else "")
+    log.info("%s finished in %.0f min: total %s, max %s%s", tag, (time.time() - t0) / 60, f"{total:,.0f}",
+             f"{maximum:,.0f}", "  SATURATED" if saturated else "")
     return {"resolution": res, "layer": lay.key, "variable": lay.variable, "variant": lay.variant,
             "spec": lay.spec or "", "class": lay.cls, "file": str(final), "status": "produced",
-            "total": total, "maximum": maximum, "clipped": clipped, "seconds": round(time.time() - t0, 1)}
+            "total": total, "maximum": maximum, "saturated": saturated, "seconds": round(time.time() - t0, 1)}
 
 
 # ------------------------------------------------------------------------------ checks
@@ -375,10 +394,27 @@ def run(cfg: dict, year: int, ufs: list[str], overwrite: bool | None = None) -> 
     work_root = output_dir(cfg, "rasterization", year)
     work_root.mkdir(parents=True, exist_ok=True)
     work_dir = Path(tempfile.mkdtemp(prefix=".work_", dir=work_root))
+    workers = int(r.get("workers", 1))
     try:
-        with ThreadPoolExecutor(max_workers=int(r.get("workers", 1))) as pool:
-            futures = [pool.submit(build_raster, cfg, year, ufs, res, lay, work_dir, overwrite) for res, lay in tasks]
-            results = [f.result() for f in futures]
+        for res in resolutions:                      # the template is the output: check it once
+            log.info("checking that the %s template is blank (reads it once)", res)
+            check_template(res, Path(cfg["resolutions"][res]["template"]),
+                           int(r["encoding"]["counts"]["nodata"]), work_dir)
+        log.info("%d rasters (%d layers x %d resolutions), each burned UF by UF over %d UFs, %d at a time",
+                 len(tasks), len(layers), len(resolutions), len(ufs), workers)
+        log.info("layers per resolution (processed in this order, %d at a time): %s", workers,
+                 ", ".join(lay.key for lay in layers))
+        results = []
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(build_raster, cfg, year, ufs, res, lay, work_dir, overwrite)
+                       for res, lay in tasks]
+            for done, fut in enumerate(as_completed(futures), 1):
+                results.append(fut.result())
+                el = time.time() - t0
+                log.info("[%d/%d rasters finished]  %.0f min elapsed, about %.0f min left", done, len(tasks),
+                         el / 60, el / done * (len(tasks) - done) / 60)
+        order = {(res, lay.key): i for i, (res, lay) in enumerate(tasks)}
+        results.sort(key=lambda x: order[(x["resolution"], x["layer"])])
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
 
@@ -395,7 +431,7 @@ def run(cfg: dict, year: int, ufs: list[str], overwrite: bool | None = None) -> 
         base = Path(m["pattern"].format(output_dir=output_dir(cfg, "rasterization", year), year=year))
         base.parent.mkdir(parents=True, exist_ok=True)
         cols = ["resolution", "layer", "variable", "variant", "spec", "class", "status",
-                "total", "maximum", "clipped", "seconds", "file"]
+                "total", "maximum", "saturated", "seconds", "file"]
         with open(base, "w", newline="", encoding="utf-8") as fh:
             w = csv.DictWriter(fh, fieldnames=cols)
             w.writeheader()

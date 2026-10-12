@@ -1,0 +1,27 @@
+{
+  "_comment": "Settings for tools/recompress_rasters.py, tools/add_overviews.py and tools/post_process_rasters.py. Keys starting with _ are comments.",
+  "input_dir": "/home/ipo/Data/outputs/BRAZILPOP/V6/STAGE_03/2022",
+  "output_dir": null,
+  "overwrite": false,
+  "workers": 2,
+  "verify": false,
+  "cog": true,
+  "max_growth_pct": 25,
+  "compress": {
+    "enabled": true,
+    "zstd_level": 9,
+    "blocksize": 512,
+    "predictor_integer": 1,
+    "predictor_float": 1
+  },
+  "overviews": {
+    "enabled": true,
+    "resampling": "AVERAGE",
+    "levels": null,
+    "first_level": 4,
+    "min_side": 256,
+    "zstd_level": 9,
+    "blocksize": 512,
+    "force": false
+  }
+}

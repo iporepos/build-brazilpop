@@ -1,0 +1,105 @@
+{
+  "2022": {
+    "especie": {
+      "1": {
+        "label": "domicilio_particular",
+        "household": true,
+        "desc": "Domicílio particular"
+      },
+      "2": {
+        "label": "domicilio_coletivo",
+        "household": true,
+        "desc": "Domicílio coletivo"
+      },
+      "3": {
+        "label": "agropecuario",
+        "household": false,
+        "desc": "Estabelecimento agropecuário"
+      },
+      "4": {
+        "label": "ensino",
+        "household": false,
+        "desc": "Estabelecimento de ensino"
+      },
+      "5": {
+        "label": "saude",
+        "household": false,
+        "desc": "Estabelecimento de saúde"
+      },
+      "6": {
+        "label": "outras_finalidades",
+        "household": false,
+        "desc": "Estabelecimento de outras finalidades"
+      },
+      "7": {
+        "label": "construcao",
+        "household": false,
+        "desc": "Edificação em construção ou reforma"
+      },
+      "8": {
+        "label": "religioso",
+        "household": false,
+        "desc": "Estabelecimento religioso"
+      }
+    },
+    "subtipo": {
+      "101": {
+        "label": "casa",
+        "desc": "Casa"
+      },
+      "102": {
+        "label": "casa_vila",
+        "desc": "Casa de vila ou em condomínio"
+      },
+      "103": {
+        "label": "apartamento",
+        "desc": "Apartamento"
+      },
+      "104": {
+        "label": "outro",
+        "desc": "Outro"
+      }
+    }
+  },
+  "2010": {
+    "_note": "2010 CNEFE `especie` column, codes 1 to 7. There is no religious species (8) and no household subtype, so the subtype dictionary is empty.",
+    "especie": {
+      "1": {
+        "label": "domicilio_particular",
+        "household": true,
+        "desc": "Domicílio particular"
+      },
+      "2": {
+        "label": "domicilio_coletivo",
+        "household": true,
+        "desc": "Domicílio coletivo"
+      },
+      "3": {
+        "label": "agropecuario",
+        "household": false,
+        "desc": "Estabelecimento agropecuário"
+      },
+      "4": {
+        "label": "ensino",
+        "household": false,
+        "desc": "Estabelecimento de ensino"
+      },
+      "5": {
+        "label": "saude",
+        "household": false,
+        "desc": "Estabelecimento de saúde"
+      },
+      "6": {
+        "label": "outras_finalidades",
+        "household": false,
+        "desc": "Estabelecimento de outras finalidades"
+      },
+      "7": {
+        "label": "construcao",
+        "household": false,
+        "desc": "Edificação em construção ou reforma"
+      }
+    },
+    "subtipo": {}
+  }
+}

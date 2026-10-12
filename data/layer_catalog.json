@@ -1,0 +1,208 @@
+{
+  "core": {
+    "layers": [
+      {
+        "variable": "CNEFE",
+        "variant": "ADDRESS",
+        "spec": "00",
+        "class": "count"
+      },
+      {
+        "variable": "CNEFE",
+        "variant": "HOUSEHOLD",
+        "spec": "000",
+        "class": "count",
+        "flag": "is_household"
+      },
+      {
+        "variable": "POPULATION",
+        "variant": "RESIDENT",
+        "class": "population",
+        "source": "p_i"
+      }
+    ]
+  },
+  "2022": {
+    "layers": [
+      {
+        "variable": "CNEFE",
+        "variant": "ADDRESS",
+        "spec": "01",
+        "class": "count",
+        "species": [
+          1
+        ]
+      },
+      {
+        "variable": "CNEFE",
+        "variant": "ADDRESS",
+        "spec": "02",
+        "class": "count",
+        "species": [
+          2
+        ]
+      },
+      {
+        "variable": "CNEFE",
+        "variant": "ADDRESS",
+        "spec": "03",
+        "class": "count",
+        "species": [
+          3
+        ]
+      },
+      {
+        "variable": "CNEFE",
+        "variant": "ADDRESS",
+        "spec": "04",
+        "class": "count",
+        "species": [
+          4
+        ]
+      },
+      {
+        "variable": "CNEFE",
+        "variant": "ADDRESS",
+        "spec": "05",
+        "class": "count",
+        "species": [
+          5
+        ]
+      },
+      {
+        "variable": "CNEFE",
+        "variant": "ADDRESS",
+        "spec": "06",
+        "class": "count",
+        "species": [
+          6
+        ]
+      },
+      {
+        "variable": "CNEFE",
+        "variant": "ADDRESS",
+        "spec": "07",
+        "class": "count",
+        "species": [
+          7
+        ]
+      },
+      {
+        "variable": "CNEFE",
+        "variant": "ADDRESS",
+        "spec": "08",
+        "class": "count",
+        "species": [
+          8
+        ]
+      },
+      {
+        "variable": "CNEFE",
+        "variant": "HOUSEHOLD",
+        "spec": "101",
+        "class": "count",
+        "flag": "is_household",
+        "subtype": [
+          101
+        ]
+      },
+      {
+        "variable": "CNEFE",
+        "variant": "HOUSEHOLD",
+        "spec": "102",
+        "class": "count",
+        "flag": "is_household",
+        "subtype": [
+          102
+        ]
+      },
+      {
+        "variable": "CNEFE",
+        "variant": "HOUSEHOLD",
+        "spec": "103",
+        "class": "count",
+        "flag": "is_household",
+        "subtype": [
+          103
+        ]
+      },
+      {
+        "variable": "CNEFE",
+        "variant": "HOUSEHOLD",
+        "spec": "104",
+        "class": "count",
+        "flag": "is_household",
+        "subtype": [
+          104
+        ]
+      }
+    ]
+  },
+  "2010": {
+    "layers": [
+      {
+        "variable": "CNEFE",
+        "variant": "ADDRESS",
+        "spec": "01",
+        "class": "count",
+        "species": [
+          1
+        ]
+      },
+      {
+        "variable": "CNEFE",
+        "variant": "ADDRESS",
+        "spec": "02",
+        "class": "count",
+        "species": [
+          2
+        ]
+      },
+      {
+        "variable": "CNEFE",
+        "variant": "ADDRESS",
+        "spec": "03",
+        "class": "count",
+        "species": [
+          3
+        ]
+      },
+      {
+        "variable": "CNEFE",
+        "variant": "ADDRESS",
+        "spec": "04",
+        "class": "count",
+        "species": [
+          4
+        ]
+      },
+      {
+        "variable": "CNEFE",
+        "variant": "ADDRESS",
+        "spec": "05",
+        "class": "count",
+        "species": [
+          5
+        ]
+      },
+      {
+        "variable": "CNEFE",
+        "variant": "ADDRESS",
+        "spec": "06",
+        "class": "count",
+        "species": [
+          6
+        ]
+      },
+      {
+        "variable": "CNEFE",
+        "variant": "ADDRESS",
+        "spec": "07",
+        "class": "count",
+        "species": [
+          7
+        ]
+      }
+    ]
+  }
+}

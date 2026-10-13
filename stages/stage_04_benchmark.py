@@ -14,8 +14,9 @@ compared with the census total `P_K` of the same unit:
   * a state is the sum of its municipalities (the 2022 database has no state layer);
   * `P_K` is the sum of the tract microdata over the unit (code prefix).
 
-Columns are named `pi_sum_<product>`, `pi_count_<product>` (cells counted), and
-`err_<product>`, `pct_err_<product>` (error against the census).
+Columns are named `pi_sum_<product>_<year>`, `err_<product>_<year>` and
+`pct_err_<product>_<year>` (error against the census); <year> is the year of the product's data
+(its `epoch`, the analysis year unless the product says otherwise).
 
 When the tables are written, the charts of tools/plot_benchmark.py are drawn into
 `<output_dir>/plots` (see `plots`, `plot_kinds`, `plot_scales` in [benchmarking]; `--no-plots`
@@ -57,13 +58,35 @@ CODE_LEN = {"district": 9, "municipality": 7, "state": 2}     # IBGE hierarchy: 
 # ------------------------------------------------------------------------------ config
 
 def products(cfg: dict, year: int) -> dict[str, dict]:
-    """Products that apply to this census year, in config order."""
+    """Products that apply to this census (analysis) year, in config order.
+
+    A product is one key and one column set across years. Its fields may be set once, and per
+    analysis year in a sub-table named by that year, which overrides them:
+
+        [benchmarking.products.ghsl]               label, min_scale: common to every year
+        [benchmarking.products.ghsl.2022]          raster, epoch = 2020: used by the 2022 run
+
+    `epoch` is the nominal year of the product data (default: the analysis year). `{epoch}` may be
+    used in `raster` and `label`. A product with year sub-tables applies only to those years;
+    `years = [...]` still restricts a product without them. The returned spec is flat and carries
+    `epoch`.
+    """
     out = {}
     for key, spec in cfg.get("benchmarking", {}).get("products", {}).items():
-        years = spec.get("years")
+        entries = {k: v for k, v in spec.items() if k.isdigit() and isinstance(v, dict)}
+        flat = {k: v for k, v in spec.items() if k not in entries}
+        if entries:
+            if str(year) not in entries:
+                continue
+            flat.update(entries[str(year)])
+        years = flat.get("years")
         if years and year not in years:
             continue
-        out[key] = spec
+        flat["epoch"] = flat.get("epoch", year)
+        for field in ("raster", "label"):
+            if isinstance(flat.get(field), str):
+                flat[field] = flat[field].replace("{epoch}", str(flat["epoch"]))
+        out[key] = flat
     return out
 
 
@@ -180,24 +203,30 @@ def make_zone_set(gdf: gpd.GeoDataFrame, scale: str, work: Path) -> tuple[ZoneSe
 
 # ----------------------------------------------------------------------------- tables
 
-def add_product(table: pd.DataFrame, key: str, sums: pd.Series, counts: pd.Series) -> pd.DataFrame:
-    """Add pi_sum / pi_count / err / pct_err columns for one product, aligned on `code`."""
+def column(prefix: str, key: str, epoch) -> str:
+    """Name of a product column: `<prefix>_<product>_<year of the product data>`."""
+    return f"{prefix}_{key}_{epoch}"
+
+
+def add_product(table: pd.DataFrame, key: str, sums: pd.Series, epoch) -> pd.DataFrame:
+    """Add pi_sum / err / pct_err columns (suffixed with the product's year) for one product, aligned on `code`."""
     t = table.copy()
-    t[f"pi_sum_{key}"] = t["code"].map(sums).astype("float64")
-    t[f"pi_count_{key}"] = t["code"].map(counts).astype("float64")
-    err = t[f"pi_sum_{key}"] - t["p_k"]
-    t[f"err_{key}"] = err
-    t[f"pct_err_{key}"] = np.where(t["p_k"] > 0, 100.0 * err / t["p_k"].where(t["p_k"] > 0), np.nan)
+    s = column("pi_sum", key, epoch)
+    t[s] = t["code"].map(sums).astype("float64")
+    err = t[s] - t["p_k"]
+    t[column("err", key, epoch)] = err
+    t[column("pct_err", key, epoch)] = np.where(t["p_k"] > 0, 100.0 * err / t["p_k"].where(t["p_k"] > 0), np.nan)
     return t
 
 
-def unit_metrics(table: pd.DataFrame, key: str) -> dict:
+def unit_metrics(table: pd.DataFrame, key: str, epoch) -> dict:
     """Accuracy of one product at one scale, over the units that have a census total."""
-    d = table[table["p_k"].notna() & table[f"pi_sum_{key}"].notna()]
-    err = d[f"pi_sum_{key}"] - d["p_k"]
+    s = column("pi_sum", key, epoch)
+    d = table[table["p_k"].notna() & table[s].notna()]
+    err = d[s] - d["p_k"]
     pos = d["p_k"] > 0
     n = len(d)
-    total_pred, total_truth = float(d[f"pi_sum_{key}"].sum()), float(d["p_k"].sum())
+    population_product, population_census = float(d[s].sum()), float(d["p_k"].sum())
     return {
         "units": n,
         "units_with_population": int(pos.sum()),
@@ -205,11 +234,10 @@ def unit_metrics(table: pd.DataFrame, key: str) -> dict:
         "mae": float(err.abs().mean()) if n else np.nan,
         "rmse": float(np.sqrt((err ** 2).mean())) if n else np.nan,
         "mape": float((err.abs()[pos] / d["p_k"][pos]).mean() * 100) if pos.any() else np.nan,
-        "total_pred": total_pred,
-        "total_truth": total_truth,
-        "mass_gap": total_pred - total_truth,
-        "ratio": total_pred / total_truth if total_truth else np.nan,
-        "units_without_cells": int(((d[f"pi_count_{key}"] == 0) & pos).sum()),
+        "population_census": population_census,
+        "population_product": population_product,
+        "population_difference": population_product - population_census,       # product - census
+        "ratio_product_to_census": population_product / population_census if population_census else np.nan,
     }
 
 
@@ -252,7 +280,6 @@ def benchmark(cfg: dict, year: int, ufs: list[str], overwrite: bool | None = Non
 
         # --- sampling: one pass per distinct raster, all of its scales together -------
         sums: dict[str, dict[str, pd.Series]] = {k: {} for k in prods}
-        cnts: dict[str, dict[str, pd.Series]] = {k: {} for k in prods}
         raster_reports = []
         for key, spec in prods.items():
             per_scale = product_rasters(cfg, year, key, spec, [s for s in scales if s in zone_sets])
@@ -265,7 +292,6 @@ def benchmark(cfg: dict, year: int, ufs: list[str], overwrite: bool | None = Non
                                   window_cells=int(b.get("window_cells", DEFAULT_WINDOW_CELLS)), work_dir=work)
                 for s in sc:
                     sums[key][s] = pd.Series(r["sums"][s][1:], index=codes[s])
-                    cnts[key][s] = pd.Series(r["counts"][s][1:], index=codes[s])
                 raster_reports.append({
                     "product": key, "raster": str(path), "scales": sc,
                     # total of the windows that were read (windows without polygons are skipped)
@@ -280,9 +306,8 @@ def benchmark(cfg: dict, year: int, ufs: list[str], overwrite: bool | None = Non
     # --- state = sum of municipalities --------------------------------------------
     if "state" in scales:
         for key in prods:
-            m_sum, m_cnt = sums[key]["municipality"], cnts[key]["municipality"]
+            m_sum = sums[key]["municipality"]
             sums[key]["state"] = m_sum.groupby(m_sum.index.str[:2]).sum()
-            cnts[key]["state"] = m_cnt.groupby(m_cnt.index.str[:2]).sum()
 
     # --- tables -------------------------------------------------------------------
     alias = {f"{int(v):02d}": k for k, v in cfg["ufs"].items()}
@@ -297,7 +322,7 @@ def benchmark(cfg: dict, year: int, ufs: list[str], overwrite: bool | None = Non
             base = g[["code"] + (["name"] if "name" in g.columns else [])].copy()
             base = base.drop_duplicates("code").merge(truth[scale], on="code", how="left")
         for key in prods:
-            base = add_product(base, key, sums[key][scale], cnts[key][scale])
+            base = add_product(base, key, sums[key][scale], prods[key]["epoch"])
         tables[scale] = base
 
     # --- metrics: a product enters a scale from its min_scale up --------------------
@@ -306,8 +331,8 @@ def benchmark(cfg: dict, year: int, ufs: list[str], overwrite: bool | None = Non
         for key, spec in prods.items():
             if SCALES.index(scale) < SCALES.index(spec.get("min_scale", "tract")):
                 continue
-            rows.append({"scale": scale, "product": key, "resolution": resolution_used(spec, scale),
-                         **unit_metrics(tables[scale], key)})
+            rows.append({"scale": scale, "product": key, "product_year": spec["epoch"],
+                         "resolution": resolution_used(spec, scale), **unit_metrics(tables[scale], key, spec["epoch"])})
     metrics = pd.DataFrame(rows)
 
     # --- outputs ------------------------------------------------------------------
@@ -331,6 +356,7 @@ def benchmark(cfg: dict, year: int, ufs: list[str], overwrite: bool | None = Non
     report = {
         "year": year, "ufs": ufs, "scales": scales, "products": list(prods),
         "labels": {k: spec.get("label", k) for k, spec in prods.items()},
+        "epochs": {k: spec["epoch"] for k, spec in prods.items()},
         "polygons": {s: len(g) for s, g in polygons.items()},
         "units_without_census_total": {s: int(t["p_k"].isna().sum()) for s, t in tables.items()},
         "census_units_without_polygon": {s: len(c) for s, c in without_polygon.items()},
@@ -349,26 +375,38 @@ def benchmark(cfg: dict, year: int, ufs: list[str], overwrite: bool | None = Non
     return report
 
 
-def run_plots(cfg: dict, config_path: str, year: int) -> list[Path]:
+def plot_settings(cfg: dict, year: int) -> dict:
+    """The settings of tools/plot_benchmark.py (see tools/plot_config.py) for the tables of this run."""
+    b = cfg.get("benchmarking", {})
+    return {
+        "input_dir": str(output_dir(cfg, "benchmarking", year)),
+        "year": year,
+        "version": str(cfg.get("project", {}).get("version", "")),
+        "kinds": list(b.get("plot_kinds", ["scatter", "hexbin"])),
+        "scales": list(b.get("plot_scales", ["tract", "district", "municipality"])),
+        "mode": b.get("plot_mode", "light"),
+        "dpi": int(b.get("plot_dpi", 150)),
+        "products": {k: {f: spec[f] for f in ("label", "min_scale") if spec.get(f)}
+                     for k, spec in products(cfg, year).items()} or None,
+        "table_pattern": b.get("table_pattern", "benchmark_{year}_{scale}.csv"),
+        "metrics_pattern": b.get("metrics_pattern", "benchmark_{year}_metrics.csv"),
+        "report_pattern": b.get("report_pattern", "benchmark_{year}_report.json"),
+    }
+
+
+def run_plots(cfg: dict, year: int) -> list[Path]:
     """Draw the charts of tools/plot_benchmark.py from the tables just written. Never raises:
     the tables are the result of the stage and a missing font or backend must not discard them."""
-    b = cfg.get("benchmarking", {})
-    if not b.get("plots", True):
+    if not cfg.get("benchmarking", {}).get("plots", True):
         return []
     try:
         from tools.plot_benchmark import build
-        written: list[Path] = []
-        scales = tuple(b.get("plot_scales", ["tract", "district", "municipality"]))
-        for kind in b.get("plot_kinds", ["scatter", "hexbin"]):
-            for path in build(config_path, year, None, b.get("plot_mode", "light"), int(b.get("plot_dpi", 150)),
-                              kind=kind, scales=scales):
-                if path not in written:
-                    written.append(path)
+        written = build(plot_settings(cfg, year))
         log.info("charts: %d files in %s", len(written), written[0].parent if written else "-")
         return written
     except Exception as e:                                   # noqa: BLE001 - see the docstring
         log.error("the tables are written but the charts failed (%s: %s); run tools/plot_benchmark.py "
-                  "to retry", type(e).__name__, e)
+                  "--config <plot json> to retry", type(e).__name__, e)
         return []
 
 
@@ -391,7 +429,7 @@ def main(argv: list[str] | None = None) -> int:
         rep = benchmark(cfg, year, ufs, overwrite=True if args.overwrite else None)
         log.info("done in %ss: %s", rep["seconds"], rep["report_path"])
         if not args.no_plots:
-            run_plots(cfg, args.config, year)
+            run_plots(cfg, year)
     except (ConfigError, FileExistsError, ZonalError) as e:
         print(f"ERROR: {e}", file=sys.stderr)
         return 1

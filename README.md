@@ -334,9 +334,9 @@ Written to `[benchmarking] output_dir`. **The result is for the whole run (all s
 - **A cell belongs to the polygon that contains its centre.** This is applied with GDAL (`gdal_rasterize` burns polygon ids on a grid that is the raster window cell for cell, numpy adds the values per id), so a cell is never split and never counted twice, and the sum over the polygons cannot exceed the raster total. NoData cells are skipped. Windows with no polygon are skipped, and windows run in parallel.
 - The census total `P_K` (and `H_K`) of a unit is the sum of the tract microdata over its code prefix: district = first 9 digits, municipality = first 7, state = first 2.
 - BrazilPop is read from the Stage 3 population rasters. `stage3_resolution` is used at every scale except those in `resolution_by_scale`; the default configuration samples **tracts at 30 m (a quality check) and the larger units at 100 m**. The resolution used at each scale is written in the metrics.
-- A polygon smaller than a cell can contain no cell centre and then gets 0 even though it has population. That is the reason for `min_scale` per product, and the number of such units is reported (`units_without_cells`).
+- A polygon smaller than a cell can contain no cell centre and then gets 0 even though it has population. That is the reason for `min_scale` per product.
 
-**Columns**, per product `<key>` (the key of `[benchmarking.products.<key>]`): `pi_sum_<key>` (sum of the cell values), `pi_count_<key>` (cells counted), `err_<key>` (`pi_sum - P_K`) and `pct_err_<key>`.
+**Columns**, per product `<key>` (the key of `[benchmarking.products.<key>]`): `pi_sum_<key>_<year>` (sum of the cell values), `err_<key>_<year>` (`pi_sum - P_K`) and `pct_err_<key>_<year>`, where `<year>` is the year of the product's data (its `epoch`; the analysis year unless the product sets one), e.g. `pi_sum_brazilpop_2022`, `pi_sum_ghsl_2020`.
 
 | File | Content |
 |------|---------|
@@ -349,12 +349,15 @@ Written to `[benchmarking] output_dir`. **The result is for the whole run (all s
 
 | Column | Definition |
 |--------|------------|
+| `scale`, `product`, `product_year`, `resolution` | the row: spatial unit, product key, year of the product's data, and the raster resolution sampled (`external` for a benchmark) |
 | `units`, `units_with_population` | units compared, and those with `P_K > 0` |
+| `population_census` | sum of `P_K` over the compared units |
+| `population_product` | sum of `pi_sum` over the same units |
+| `population_difference` | `population_product - population_census` |
+| `ratio_product_to_census` | `population_product / population_census` (1.0 = the totals agree) |
 | `bias` | mean of `e` |
 | `mae`, `rmse` | mean of `|e|`, square root of the mean of `e²` |
 | `mape` | mean of `|e| / P_K` in percent, over units with `P_K > 0` |
-| `total_pred`, `total_truth`, `mass_gap`, `ratio` | sums, their difference and quotient |
-| `units_without_cells` | units with `P_K > 0` and no cell centre |
 
 A product enters the metrics of a scale from its `min_scale` up (its columns are still written at every scale).
 
@@ -365,11 +368,23 @@ Two branches use these tables:
 
 **Adding a benchmark** is one block under `[benchmarking.products.<key>]` (`raster`, `min_scale`, optional `label` and `years`); nothing else changes. Its columns appear in every table, the master layer and the metrics, and in the charts.
 
-**Charts.** Stage 4 draws them itself when the tables are written (`plots = true` in `[benchmarking]`; `--no-plots` skips them; a failure never costs the tables), into `<output_dir>/plots`. The same charts can be redrawn at any time with `tools/plot_benchmark.py --config <config> --year <year> [--kind scatter|hexbin] [--scales tract district municipality state]`, which only reads the Stage 4 tables. Per scale there is one figure of census against estimate, one panel per product, three across (`scatter_<scale>_...`: one dot per unit, adaptive size and opacity; `hexbin_<scale>_...`: tracts per hexagon, for national runs), with the figures of each panel (units, MAE, MAPE, estimate/census, units beyond the axes, largest error) written under it. `bars_metrics_by_scale_<year>.png` has MAPE, MAE, RMSE and bias side by side, horizontal bars grouped by scale (log value axes, every bar named and valued, no legend). BrazilPop is the accent blue and the benchmarks are gray (`--accent` changes the accent product). Labels come from the `label` of each product (`BrazilPop V{version} {year}`). A product with no data (HRSL until its column exists) is drawn as a "no data" row and panel. It needs matplotlib (`requirements.txt`).
+**One product across analysis years.** A product is one key, so its column stem (`pi_sum_ghsl_<year>`) is the same in every run; only the year suffix follows the epoch. When its data differ by census year (GHSL has epochs 2010 and 2020 for the 2010 and 2022 censuses), give each analysis year its own sub-table: `[benchmarking.products.ghsl.2010]` with `raster` and `epoch = 2010`, `[benchmarking.products.ghsl.2022]` with `raster` and `epoch = 2020`. Common fields (`label`, `min_scale`) stay on the product and a sub-table overrides them for its year. `epoch` is the nominal year of the data (default: the analysis year) and `{epoch}` can be used in `raster` and `label` (`label = "GHSL {epoch}"`). A product with year sub-tables is used only in those years, and the report records the epoch of every product (`epochs`). Without sub-tables a product behaves as before (`raster` with `{year}`, optional `years`).
+
+**Charts.** Stage 4 draws them itself when the tables are written (`plots = true` in `[benchmarking]`; `--no-plots` skips them; a failure never costs the tables), into `<output_dir>/plots`. The same charts can be redrawn at any time with `tools/plot_benchmark.py --config plot_benchmark.json` (the only argument), which only reads the Stage 4 tables. Its JSON is small and separate from the pipeline TOML (`input_dir`, `year`, `output_dir`, `version`, `kinds`, `scales`, `mode`, `dpi`, `accent`, `products` with a `label` and `min_scale` each; only `input_dir` and `year` are required; schema in `tools/plot_config.py`, example in `tools/plot_benchmark.example.json`). Per scale there is one figure of census against estimate, one panel per product, three across (`scatter_<scale>_...`: one dot per unit, adaptive size and opacity; `hexbin_<scale>_...`: tracts per hexagon, for national runs), with the figures of each panel (units, MAE, MAPE, estimate/census, units beyond the axes, largest error) written under it. `bars_metrics_by_scale_<year>.png` has MAPE, MAE, RMSE and bias side by side, horizontal bars grouped by scale (log value axes, every bar named and valued, no legend). BrazilPop is the accent blue and the benchmarks are gray (`accent` changes the accent product). Labels come from the `label` of each product in the JSON (Stage 4 passes the ones of its own config) (`BrazilPop V{version} {year}`). A product with no data (HRSL until its column exists) is drawn as a "no data" row and panel. It needs matplotlib (`requirements.txt`).
 
 **Cost (timed on the whole of Brazil with national rasters of the previous product version, 24 cores, NVMe scratch, 16 workers).** About 6.5 minutes for four products at three polygon scales: 258 s for the 22.6-billion-cell 30 m raster, 24 s for BrazilPop 100 m, 28 s for LandScan, 33 s for WorldPop. Peak memory of the parent process 5.7 GB, about 1 GB per worker.
 
 ---
+
+## Running a stage
+
+`run_pipeline.py` is one entry point for the four stages:
+
+```
+.venv/bin/python run_pipeline.py --config config.local.toml --stage 4 [--year 2022] [--overwrite]
+```
+
+`--config` and `--stage` (1 ingest, 2 vector enrichment, 3 rasterization, 4 benchmark) are required. `--year` defaults to `execution.target_year` and `--overwrite` to `execution.overwrite`. Other options are handed to the stage unchanged (`--uf DF`, `--no-plots` for stage 4). The exit code is the stage's. Each stage can still be run on its own (`python stages/stage_04_benchmark.py --config ...`).
 
 ## Configuration
 

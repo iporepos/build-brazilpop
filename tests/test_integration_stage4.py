@@ -60,7 +60,7 @@ def test_scales_agree_on_the_state_total(result):
     _, rep = result
     t = rep["_tables"]
     for key in ("brazilpop", "landscan"):
-        assert t["state"][f"pi_sum_{key}"].sum() == pytest.approx(t["municipality"][f"pi_sum_{key}"].sum())
+        assert t["state"][f"pi_sum_{key}_2022"].sum() == pytest.approx(t["municipality"][f"pi_sum_{key}_2022"].sum())
         assert t["state"]["p_k"].sum() == pytest.approx(t["municipality"]["p_k"].sum())
 
 
@@ -68,4 +68,4 @@ def test_brazilpop_is_close_to_the_census_in_total(result):
     _, rep = result
     m = rep["_metrics"].set_index(["product", "scale"])
     for scale in ("tract", "district", "municipality", "state"):
-        assert 0.97 < m.loc[("brazilpop", scale), "ratio"] < 1.03
+        assert 0.97 < m.loc[("brazilpop", scale), "ratio_product_to_census"] < 1.03

@@ -1,18 +1,21 @@
 """Quick-look charts of the Stage 4 results.
 
-    .venv/bin/python tools/plot_benchmark.py --config config.local.toml --year 2022
+    .venv/bin/python tools/plot_benchmark.py --config tools/plot_benchmark.local.json
 
-Reads what Stage 4 wrote (the tract and metrics tables) and writes two PNGs:
+Reads what Stage 4 wrote (the tract and metrics tables) and writes the PNGs. Settings come from one
+small JSON file (tools/plot_config.py; scales, kinds, mode, dpi, accent and the products and labels), not
+from the pipeline TOML. Stage 4 passes the same settings itself.
 
-  1. scatter_{scale}_truth_vs_pred_{year}.png  (or hexbin_..., with --kind hexbin), for the
-        scales of --scales (default tract, district, municipality; a single unit is one dot)
+
+  1. scatter_{scale}_truth_vs_pred_{year}.png  (or hexbin_..., kind "hexbin"), for the
+        scales of `scales` (default tract, district, municipality; a single unit is one dot)
         census residents against the estimate, one panel per product, tracts; dots adapt
         their size and opacity to the number of tracts, hexbin counts tracts per hexagon
   2. bars_metrics_by_scale_{year}.png
         MAPE, MAE, RMSE and bias, one panel per metric (units differ, so no shared
         axis), horizontal bars grouped by scale with one bar per product
 
-Colours: the product under evaluation (BrazilPop, `--accent`) is the accent blue and every
+Colours: the product under evaluation (BrazilPop, `accent`) is the accent blue and every
 benchmark is gray (light gray bars, dark gray dots and hexagons). Panels have the seaborn
 darkgrid tone with a white grid. The hexbin density ramps start at a very light tone that
 still differs from the panel. Axes, ticks and tick
@@ -27,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -85,7 +89,6 @@ def _pick_font() -> str:
     return "sans-serif"
 PRODUCT_LABEL = {"brazilpop": "BrazilPop", "landscan": "LandScan", "worldpop": "WorldPop", "ghsl": "GHSL",
                  "hrsl": "HRSL V1 2018"}
-EXPECTED_PRODUCTS = ["hrsl"]   # always on the charts: drawn as a null bar / null panel while it has no data
 
 
 def label_of(key: str, labels: dict | None = None) -> str:
@@ -494,84 +497,98 @@ def bars_metrics_by_scale(metrics: pd.DataFrame, products: list[str], out: Path,
 
 # ------------------------------------------------------------------------------------ CLI
 
-def build(config: str, year: int, out_dir: Path | None, mode: str, dpi: int,
-          accent: str = ACCENT_KEY, kind: str = "scatter",
-          scales: tuple[str, ...] = ("tract", "district", "municipality")) -> list[Path]:
-    from stages.config import load_config, output_dir
-    from stages.stage_04_benchmark import products as cfg_products
+def plain_columns(table: pd.DataFrame, epochs: dict | None = None) -> pd.DataFrame:
+    """Stage 4 names its product columns `pi_sum_<product>_<year>`; the charts work with
+    `pi_sum_<product>`. Tables from before the year was added are returned unchanged."""
+    ren = {}
+    for key, epoch in (epochs or {}).items():
+        if f"pi_sum_{key}_{epoch}" in table.columns:
+            ren[f"pi_sum_{key}_{epoch}"] = f"pi_sum_{key}"
+    for c in table.columns:
+        m = re.fullmatch(r"pi_sum_(.+)_(\d{4})", c)
+        if m and c not in ren and f"pi_sum_{m[1]}" not in table.columns:
+            ren[c] = f"pi_sum_{m[1]}"
+    return table.rename(columns=ren)
 
-    cfg = load_config(config)
-    base = output_dir(cfg, "benchmarking", year)
-    b = cfg["benchmarking"]
-    tract = pd.read_csv(base / b.get("table_pattern", "benchmark_{year}_{scale}.csv").format(year=year, scale="tract"),
-                        dtype={"code": str})
-    metrics = pd.read_csv(base / b.get("metrics_pattern", "benchmark_{year}_metrics.csv").format(year=year))
-    report_p = base / b.get("report_pattern", "benchmark_{year}_report.json").format(year=year)
+
+def build(settings: dict) -> list[Path]:
+    """Draw every chart of `settings` (tools/plot_config.py: a loaded JSON file or a dict built by
+    Stage 4) from the Stage 4 tables. The bar chart is drawn once, a scatter per kind and scale."""
+    from tools.plot_config import validate
+
+    st = validate(settings)
+    year, kinds, scales, mode, dpi, accent = st["year"], st["kinds"], st["scales"], st["mode"], st["dpi"], st["accent"]
+    base = Path(st["input_dir"].replace("{year}", str(year)))
+    pattern = {n: st[f"{n}_pattern"] for n in ("table", "metrics", "report")}
+    report_p = base / pattern["report"].format(year=year)
     report = json.loads(report_p.read_text()) if report_p.is_file() else {}
-    keys = [k for k in cfg_products(cfg, year) if f"pi_sum_{k}" in tract.columns]
-    configured = list(cfg_products(cfg, year)) + EXPECTED_PRODUCTS
-    nulls = [k for i, k in enumerate(configured) if k not in keys and k not in configured[:i]]
+    epochs = report.get("epochs", {})
+    tract = plain_columns(pd.read_csv(base / pattern["table"].format(year=year, scale="tract"),
+                                      dtype={"code": str}), epochs)
+    metrics = pd.read_csv(base / pattern["metrics"].format(year=year)).rename(
+        columns={"ratio_product_to_census": "ratio"})        # the charts' short name
+
+    spec = st["products"]
+    if spec is None:                         # no list: what the table holds, named by the Stage 4 report
+        spec = {c[len("pi_sum_"):]: {} for c in tract.columns if c.startswith("pi_sum_")}
+    keys = [k for k in spec if f"pi_sum_{k}" in tract.columns]
+    nulls = [k for k in spec if k not in keys]
     if not keys:
-        raise SystemExit(f"{config}: no [benchmarking.products.*] entry matches the columns of the Stage 4 "
-                         f"table ({', '.join(c[7:] for c in tract.columns if c.startswith('pi_sum_')) or 'none'}). "
-                         f"Use the config that produced the table, or add the products to this one.")
-    version = str(cfg.get("project", {}).get("version", ""))
+        have = ", ".join(c[7:] for c in tract.columns if c.startswith("pi_sum_")) or "none"
+        raise SystemExit(f"no product of the config matches the columns of the Stage 4 table ({have}); "
+                         f"check `products` and input_dir")
     labels = dict(report.get("labels", {}))
-    for k, spec in cfg_products(cfg, year).items():          # the current config wins over an older report
-        if spec.get("label"):
-            labels[k] = spec["label"]
-    labels = {k: expand_label(v, version, year) for k, v in labels.items()}
+    for k, s in spec.items():                # the config wins over an older report
+        if s.get("label"):
+            labels[k] = s["label"]
+    labels = {k: expand_label(v, st["version"], year) for k, v in labels.items()}
     all_keys = keys + nulls
 
     run_ufs = report.get("ufs", [])
     ufs = ("Brazil" if len(run_ufs) >= 27 else f"{len(run_ufs)} UFs" if len(run_ufs) > 6
            else ", ".join(run_ufs) or "selected UFs")        # a national title is not a list of 27 codes
-    out = Path(out_dir) if out_dir else base / "plots"
+    out = Path(st["output_dir"].replace("{year}", str(year))) if st["output_dir"] else base / "plots"
     notes = []
     single = [s for s in SCALES if s in set(metrics["scale"])
               and int(metrics[metrics["scale"] == s]["units"].max()) == 1]
     if len(single) > 1:
         notes.append(f"{', '.join(x.capitalize() for x in single)} each hold a single unit in this run, "
                      f"so those groups describe the same unit")
-    for k, spec in cfg_products(cfg, year).items():
-        if k in keys and spec.get("min_scale", "tract") != "tract":
-            notes.append(f"{label_of(k, labels)} is scored from the {spec['min_scale']} scale up")
+    for k in keys:
+        if spec[k].get("min_scale", "tract") != "tract":
+            notes.append(f"{label_of(k, labels)} is scored from the {spec[k]['min_scale']} scale up")
     for k in nulls:
         notes.append(f"{label_of(k, labels)} has no data in this run")
-    scatters = []
-    for scale in scales:                  # one figure per scale; a state or a municipality may be one point
-        path = base / b.get("table_pattern", "benchmark_{year}_{scale}.csv").format(year=year, scale=scale)
-        if not path.is_file():
-            print(f"skipped the {scale} scatter: {path} not found", file=sys.stderr)
-            continue
-        table = tract if scale == "tract" else pd.read_csv(path, dtype={"code": str})
-        scatters.append(scatter_truth_vs_pred(
-            table, metrics, all_keys, out / f"{kind}_{scale}_truth_vs_pred_{year}.png",
-            f"{_plural(scale, 2).capitalize()}, {ufs} {year}: estimate against census", mode, dpi, labels,
-            accent, kind, null_products=nulls, scale=scale))
-    f2 = bars_metrics_by_scale(metrics, all_keys, out / f"bars_metrics_by_scale_{year}.png",
-                               f"Accuracy by scale, {ufs} {year}", mode, dpi, footnote="; ".join(notes),
-                               labels=labels, accent=accent, null_products=nulls)
-    return scatters + [f2]
+    written = []
+    for kind in kinds:
+        for scale in scales:              # one figure per scale; a state or a municipality may be one point
+            path = base / pattern["table"].format(year=year, scale=scale)
+            if not path.is_file():
+                print(f"skipped the {scale} {kind}: {path} not found", file=sys.stderr)
+                continue
+            table = tract if scale == "tract" else plain_columns(pd.read_csv(path, dtype={"code": str}), epochs)
+            written.append(scatter_truth_vs_pred(
+                table, metrics, all_keys, out / f"{kind}_{scale}_truth_vs_pred_{year}.png",
+                f"{_plural(scale, 2).capitalize()}, {ufs} {year}: estimate against census", mode, dpi, labels,
+                accent, kind, null_products=nulls, scale=scale))
+    written.append(bars_metrics_by_scale(
+        metrics, all_keys, out / f"bars_metrics_by_scale_{year}.png", f"Accuracy by scale, {ufs} {year}",
+        mode, dpi, footnote="; ".join(notes), labels=labels, accent=accent, null_products=nulls))
+    return written
 
 
 def main(argv: list[str] | None = None) -> int:
+    from tools.plot_config import PlotConfigError, load
+
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--config", required=True)
-    ap.add_argument("--year", type=int, required=True)
-    ap.add_argument("--out-dir", help="default: <benchmarking output_dir>/plots")
-    ap.add_argument("--mode", choices=["light", "dark"], default="light")
-    ap.add_argument("--dpi", type=int, default=150)
-    ap.add_argument("--accent", default=ACCENT_KEY,
-                    help="product drawn in the accent blue (default brazilpop); the others are gray")
-    ap.add_argument("--scales", nargs="+", choices=SCALES, default=["tract", "district", "municipality"],
-                    help="one tract-style scatter / hexbin figure per scale (default: tract district municipality)")
-    ap.add_argument("--kind", choices=["scatter", "hexbin"], default="scatter",
-                    help="tract chart: one dot per tract, or a hexagon density map (for national runs)")
+    ap.add_argument("--config", required=True, help="JSON settings (see tools/plot_benchmark.example.json)")
     args = ap.parse_args(argv)
-    for p in build(args.config, args.year, args.out_dir, args.mode, args.dpi, args.accent, args.kind,
-                   tuple(args.scales)):
-        print(p)
+    try:
+        for p in build(load(args.config)):
+            print(p)
+    except PlotConfigError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
     return 0
 
 

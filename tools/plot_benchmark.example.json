@@ -1,0 +1,19 @@
+{
+  "_comment": "Settings for tools/plot_benchmark.py. Keys starting with _ are comments. Only input_dir and year are required.",
+  "input_dir": "/path/to/STAGE_04/{year}",
+  "year": 2022,
+  "output_dir": null,
+  "version": "6",
+  "kinds": ["scatter", "hexbin"],
+  "scales": ["tract", "district", "municipality"],
+  "mode": "light",
+  "dpi": 150,
+  "accent": "brazilpop",
+  "products": {
+    "brazilpop": {"label": "BrazilPop V{version} {year}"},
+    "landscan": {"label": "LandScan {year}", "min_scale": "municipality"},
+    "worldpop": {"label": "WorldPop {year}", "min_scale": "municipality"},
+    "ghsl": {"label": "GHSL 2020", "min_scale": "municipality"},
+    "hrsl": {"label": "HRSL V1 2018", "min_scale": "municipality"}
+  }
+}

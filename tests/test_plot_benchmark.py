@@ -146,3 +146,45 @@ def test_a_product_not_scored_at_a_scale_gets_an_empty_panel(tmp_path):
     t = pd.DataFrame({"code": ["1"], "p_k": [1000.0], "pi_sum_brazilpop": [990.0], "pi_sum_landscan": [np.nan]})
     out = scatter_truth_vs_pred(t, frames()[1], PRODUCTS, tmp_path / "s.png", "t", scale="municipality")
     assert out.stat().st_size > 0
+
+
+def test_plot_config_is_minimal_strict_and_commented(tmp_path):
+    import json
+    from tools.plot_config import PlotConfigError, load, validate
+    p = tmp_path / "plot.json"
+    p.write_text(json.dumps({"_comment": "x", "input_dir": "/d/{year}", "year": 2022}))
+    cfg = load(p)
+    assert cfg["kinds"] == ["scatter"] and cfg["products"] is None and cfg["mode"] == "light"
+    for bad in ({"year": 2022}, {"input_dir": "d"}, {"input_dir": "d", "year": 2022, "dpii": 9},
+                {"input_dir": "d", "year": 2022, "scales": ["village"]},
+                {"input_dir": "d", "year": 2022, "products": {"a": {"min_scale": "x"}}}):
+        with pytest.raises(PlotConfigError):
+            validate(bad)
+    with pytest.raises(PlotConfigError):
+        load(tmp_path / "missing.json")
+
+
+def test_build_runs_from_the_settings_alone(tmp_path):
+    from tools.plot_benchmark import build
+    t, m = frames()
+    t.to_csv(tmp_path / "benchmark_2022_tract.csv", index=False)
+    m.to_csv(tmp_path / "benchmark_2022_metrics.csv", index=False)
+    out = build({"input_dir": str(tmp_path), "year": 2022, "dpi": 50, "scales": ["tract"],
+                 "products": {"brazilpop": {"label": "BrazilPop V{version}"}, "landscan": {}, "hrsl": {}},
+                 "version": "6"})
+    names = sorted(p.name for p in out)
+    assert names == ["bars_metrics_by_scale_2022.png", "scatter_tract_truth_vs_pred_2022.png"]
+    assert all(p.parent == tmp_path / "plots" and p.stat().st_size > 3_000 for p in out)
+
+
+def test_charts_read_the_year_suffixed_columns_of_stage_4(tmp_path):
+    from tools.plot_benchmark import build, plain_columns
+    t, m = frames(["brazilpop", "ghsl"])
+    t = t.rename(columns={"pi_sum_brazilpop": "pi_sum_brazilpop_2022", "pi_sum_ghsl": "pi_sum_ghsl_2020"})
+    m = m.rename(columns={"ratio": "ratio_product_to_census"})
+    assert {"pi_sum_brazilpop", "pi_sum_ghsl"} <= set(plain_columns(t, {"ghsl": 2020}).columns)
+    t.to_csv(tmp_path / "benchmark_2022_tract.csv", index=False)
+    m.to_csv(tmp_path / "benchmark_2022_metrics.csv", index=False)
+    (tmp_path / "benchmark_2022_report.json").write_text('{"epochs": {"brazilpop": 2022, "ghsl": 2020}}')
+    out = build({"input_dir": str(tmp_path), "year": 2022, "dpi": 50, "scales": ["tract"]})
+    assert len(out) == 2 and all(p.stat().st_size > 3_000 for p in out)

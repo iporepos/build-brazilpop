@@ -255,8 +255,9 @@ population_relative_tolerance  = 1e-6            # accumulated in Float64, store
 #   * the census total of a unit is the sum of its tracts' microdata (code prefix).
 # Tract polygons and the microdata come from [enrichment.<year>].
 #
-# Columns written per product `<key>`: pi_sum_<key>, pi_count_<key> (cells counted),
-# err_<key> and pct_err_<key> (against the census).
+# Columns written per product `<key>`: pi_sum_<key>_<year>, err_<key>_<year> and pct_err_<key>_<year>
+# (<year> = the year of the product's data, `epoch`)
+# (against the census).
 # ==============================================================================
 [benchmarking]
 output_dir      = "/mnt/hdd3/brazilpop/{year}/benchmarks"      # Stage 4 writes here; it reads Stage 3 from [rasterization] output_dir
@@ -268,7 +269,8 @@ table_pattern   = "benchmark_{year}_{scale}.csv"      # one table per scale
 metrics_pattern = "benchmark_{year}_metrics.csv"      # bias, MAE, RMSE, MAPE and totals per product and scale
 report_pattern  = "benchmark_{year}_report.json"
 
-# Charts drawn when the tables are written (tools/plot_benchmark.py; `--no-plots` skips them).
+# Charts drawn when the tables are written (tools/plot_benchmark.py; `--no-plots` skips them;
+# the same tool redraws them from its own JSON file, tools/plot_benchmark.example.json).
 # They go to {output_dir}/plots. A chart that fails never costs the tables.
 plots        = true
 plot_kinds   = ["scatter", "hexbin"]                     # one dots-per-unit figure and one hexagon-density figure per scale
@@ -298,7 +300,7 @@ municipality_layer       = "municipios"
 municipality_code_column = "code"
 municipality_name_column = "name"
 
-# Products. The key becomes the column suffix: pi_sum_brazilpop, pi_sum_landscan, ...
+# Products. The key becomes part of the column name: pi_sum_brazilpop_2022, pi_sum_landscan_2022, ...
 # `label`: the name shown in charts (optional, default: the key). `min_scale`: the product
 # enters the accuracy metrics from this scale up (a coarse raster is not fairly evaluated on
 # small units). `years`: census years it applies to (optional).
@@ -316,6 +318,21 @@ tract = "030"
 
 # External rasters: a full path (may use {year}). EPSG:4326, one band, NoData declared.
 # Add one block per benchmark; nothing else changes.
+#
+# One product, several analysis years: put the raster of each census year in a sub-table named
+# by that year. `epoch` is the nominal year of the data (default: the analysis year) and fills
+# {epoch} in `raster` and `label`. The column stem is the same in every run (pi_sum_ghsl_2020 / _2010), and a
+# product with sub-tables is used only in the years it lists:
+#
+#   [benchmarking.products.ghsl]
+#   label     = "GHSL {epoch}"
+#   min_scale = "municipality"
+#   [benchmarking.products.ghsl.2010]
+#   raster    = ".../GHSL_BRAZIL_2010.tif"
+#   epoch     = 2010
+#   [benchmarking.products.ghsl.2022]
+#   raster    = ".../GHSL_BRAZIL_2020.tif"
+#   epoch     = 2020
 [benchmarking.products.landscan]
 label     = "LandScan {year}"
 raster    = "/media/ipo/Feynman/planalto/ZENODO/BRAZILPOP/V500/T1/ASSETS/BCMK/LANDSCAN_BRAZIL_{year}.tif"

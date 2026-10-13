@@ -50,10 +50,10 @@ def test_centre_rule_nodata_and_polygon_smaller_than_a_cell(tmp_path, raster):
         box(10.9, 51.9, 11.1, 52.1),      # contains no cell centre
     ])
     r = sample_raster(raster, [zs], workers=1)
-    s, c = r["sums"]["s"], r["counts"]["s"]
-    assert (s[1], c[1]) == (1 + 2 + 5 + 6 + 9 + 10, 6)
-    assert (s[2], c[2]) == (3 + 4 + 7 + 8 + 11, 5)          # the NoData cell is not counted
-    assert (s[3], c[3]) == (0, 0)                            # centre rule: nothing, not a fraction
+    s = r["sums"]["s"]
+    assert s[1] == 1 + 2 + 5 + 6 + 9 + 10
+    assert s[2] == 3 + 4 + 7 + 8 + 11                        # the NoData cell is not added
+    assert s[3] == 0                                         # centre rule: nothing, not a fraction
     assert r["raster_total"] == sum(v for row in VALUES for v in row if v != -9999)
 
 
@@ -61,7 +61,7 @@ def test_overlapping_polygons_never_count_a_cell_twice(tmp_path, raster):
     zs = zone_set(tmp_path / "z.gpkg", "s", [box(11.6, 50, 14, 53), box(13.4, 52.4, 20, 60)])
     r = sample_raster(raster, [zs], workers=1)
     # cell (13.5, 52.5) = 4 lies in both: the last polygon burned (zone 2) takes it
-    assert r["sums"]["s"][2] == 4 and r["counts"]["s"][2] == 1
+    assert r["sums"]["s"][2] == 4
     assert r["sums"]["s"][1] == 3 + 7 + 8 + 11
     assert r["sums"]["s"][1:].sum() <= r["raster_total"]
 
@@ -78,7 +78,6 @@ def test_several_windows_and_workers_give_the_same_result(tmp_path, raster):
     many = sample_raster(raster, [zs], workers=2, window_cells=4)          # one raster row per window
     assert one["windows"] == 1 and many["windows"] == 3
     np.testing.assert_array_equal(one["sums"]["s"], many["sums"]["s"])
-    np.testing.assert_array_equal(one["counts"]["s"], many["counts"]["s"])
     assert one["raster_total"] == many["raster_total"]
 
 
@@ -102,7 +101,7 @@ def test_other_data_types_and_nodata_values(tmp_path, dtype, nodata):
     path = write_raster(tmp_path / "r.tif", rows, dtype=dtype, nodata=nodata)
     zs = zone_set(tmp_path / "z.gpkg", "s", [box(10, 50, 14, 53)])
     r = sample_raster(path, [zs], workers=1)
-    assert r["sums"]["s"][1] == 66 and r["counts"]["s"][1] == 11
+    assert r["sums"]["s"][1] == 66
 
 
 def test_float_raster_with_real_nan_pixels(tmp_path):
@@ -118,7 +117,7 @@ def test_float_raster_with_real_nan_pixels(tmp_path):
                     "-a_nodata", "nan", str(raw), str(path)], check=True)
     zs = zone_set(tmp_path / "z.gpkg", "s", [box(10, 50, 14, 53)])
     r = sample_raster(path, [zs], workers=1)
-    assert r["sums"]["s"][1] == 66 and r["counts"]["s"][1] == 11 and r["raster_total"] == 66
+    assert r["sums"]["s"][1] == 66 and r["raster_total"] == 66
 
 
 def test_raster_that_is_not_4326_is_rejected(tmp_path):

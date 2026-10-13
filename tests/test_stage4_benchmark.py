@@ -104,30 +104,30 @@ def test_tracts_are_sampled_from_the_30m_raster(result):
     _, rep = result
     t = rep["_tables"]["tract"].set_index("code")
     # tract T1: x 10..12 -> cols 0..3, y 52..54 -> rows 0..3 (rows count from the top, y=54)
-    assert t.loc[T1, "pi_sum_brazilpop"] == block_sum(FINE, slice(0, 4), slice(0, 4))
-    assert t.loc[T4, "pi_sum_brazilpop"] == block_sum(FINE, slice(4, 8), slice(4, 8))
-    assert t.loc[T1, "pi_count_brazilpop"] == 16
-    assert t.loc[T1, "err_brazilpop"] == t.loc[T1, "pi_sum_brazilpop"] - 100.0
-    assert t.loc[T1, "pct_err_brazilpop"] == pytest.approx(100 * t.loc[T1, "err_brazilpop"] / 100.0)
+    assert t.loc[T1, "pi_sum_brazilpop_2022"] == block_sum(FINE, slice(0, 4), slice(0, 4))
+    assert t.loc[T4, "pi_sum_brazilpop_2022"] == block_sum(FINE, slice(4, 8), slice(4, 8))
+    assert "pi_count_brazilpop" not in t.columns
+    assert t.loc[T1, "err_brazilpop_2022"] == t.loc[T1, "pi_sum_brazilpop_2022"] - 100.0
+    assert t.loc[T1, "pct_err_brazilpop_2022"] == pytest.approx(100 * t.loc[T1, "err_brazilpop_2022"] / 100.0)
 
 
 def test_districts_and_municipality_use_the_100m_raster_and_state_is_their_sum(result):
     _, rep = result
     d = rep["_tables"]["district"].set_index("code")
-    assert d.loc[D1, "pi_sum_brazilpop"] == block_sum(COARSE, slice(0, 2), slice(0, 4))     # y 52..54
-    assert d.loc[D2, "pi_sum_brazilpop"] == block_sum(COARSE, slice(2, 4), slice(0, 4))
+    assert d.loc[D1, "pi_sum_brazilpop_2022"] == block_sum(COARSE, slice(0, 2), slice(0, 4))     # y 52..54
+    assert d.loc[D2, "pi_sum_brazilpop_2022"] == block_sum(COARSE, slice(2, 4), slice(0, 4))
     assert d.loc[D1, "p_k"] == 300.0 and d.loc[D2, "p_k"] == 700.0                           # P_K = sum of tracts
     assert d.loc[D1, "name"] == "North"
     m = rep["_tables"]["municipality"].set_index("code")
-    assert m.loc[M, "pi_sum_brazilpop"] == COARSE.sum() and m.loc[M, "p_k"] == 1000.0
+    assert m.loc[M, "pi_sum_brazilpop_2022"] == COARSE.sum() and m.loc[M, "p_k"] == 1000.0
     s = rep["_tables"]["state"].set_index("code")
-    assert s.loc["53", "pi_sum_brazilpop"] == m.loc[M, "pi_sum_brazilpop"]
+    assert s.loc["53", "pi_sum_brazilpop_2022"] == m.loc[M, "pi_sum_brazilpop_2022"]
     assert s.loc["53", "name"] == "DF" and s.loc["53", "p_k"] == 1000.0
 
 
 def test_external_product_is_sampled_at_every_scale_but_scored_from_min_scale(result):
     _, rep = result
-    assert rep["_tables"]["tract"].set_index("code").loc[T1, "pi_sum_ext"] == 50.0 * 4      # 4 coarse cells
+    assert rep["_tables"]["tract"].set_index("code").loc[T1, "pi_sum_ext_2022"] == 50.0 * 4      # 4 coarse cells
     met = rep["_metrics"]
     ext = met[met["product"] == "ext"]
     assert sorted(ext["scale"]) == ["municipality", "state"]                                   # min_scale
@@ -156,14 +156,15 @@ def test_metrics_report_the_resolution_each_scale_used(result):
 def test_metric_values_are_computed_from_the_unit_errors(result):
     _, rep = result
     t = rep["_tables"]["tract"]
-    err = t["pi_sum_brazilpop"] - t["p_k"]
+    err = t["pi_sum_brazilpop_2022"] - t["p_k"]
     m = rep["_metrics"].set_index(["product", "scale"]).loc[("brazilpop", "tract")]
     assert m["units"] == 4
     assert m["bias"] == pytest.approx(err.mean())
     assert m["mae"] == pytest.approx(err.abs().mean())
     assert m["rmse"] == pytest.approx(np.sqrt((err ** 2).mean()))
     assert m["mape"] == pytest.approx((err.abs() / t["p_k"]).mean() * 100)
-    assert m["mass_gap"] == pytest.approx(t["pi_sum_brazilpop"].sum() - 1000.0)
+    assert m["population_difference"] == pytest.approx(t["pi_sum_brazilpop_2022"].sum() - 1000.0)
+    assert m["population_census"] == 1000.0 and m["product_year"] == 2022
 
 
 def test_output_files_and_master_layer(result, tmp_path):
@@ -175,7 +176,7 @@ def test_output_files_and_master_layer(result, tmp_path):
         assert (out / name).is_file(), name
     g = pyogrio.read_dataframe(out / "benchmark_2022_tracts.gpkg", layer="tracts")
     assert len(g) == 4 and g.crs.to_epsg() == 4326
-    assert {"pi_sum_brazilpop", "pi_sum_ext", "err_brazilpop", "district_code", "municipality_code", "uf_code"} <= set(g.columns)
+    assert {"pi_sum_brazilpop_2022", "pi_sum_ext_2022", "err_brazilpop_2022", "district_code", "municipality_code", "uf_code"} <= set(g.columns)
     assert set(g["district_code"]) == {D1, D2} and set(g["uf_code"]) == {"53"}
     saved = json.loads((out / "benchmark_2022_report.json").read_text())
     assert saved["census_total"] == 1000.0 and saved["polygons"] == {"tract": 4, "district": 2, "municipality": 1}
@@ -186,18 +187,18 @@ def test_a_tract_stored_as_two_polygons_is_one_row_with_the_same_sum(tmp_path):
     base = benchmark(make_cfg(tmp_path / "a"), 2022, ["DF"])["_tables"]["tract"].set_index("code")
     split = benchmark(make_cfg(tmp_path / "b", split_tract=True), 2022, ["DF"])["_tables"]["tract"].set_index("code")
     assert len(split) == 4
-    assert split.loc[T2, "pi_sum_brazilpop"] == base.loc[T2, "pi_sum_brazilpop"]
+    assert split.loc[T2, "pi_sum_brazilpop_2022"] == base.loc[T2, "pi_sum_brazilpop_2022"]
 
 
 def test_unit_metrics_ignore_units_without_census_total_and_zero_population_in_mape():
     t = pd.DataFrame({"code": list("abcd"), "p_k": [100.0, 0.0, np.nan, 50.0],
-                      "pi_sum_x": [110.0, 5.0, 40.0, 40.0], "pi_count_x": [3, 1, 2, 0]})
-    m = unit_metrics(t, "x")
+                      "pi_sum_x_2020": [110.0, 5.0, 40.0, 40.0]})
+    m = unit_metrics(t, "x", 2020)
     assert m["units"] == 3 and m["units_with_population"] == 2          # NaN truth is out; zero is in
     assert m["bias"] == pytest.approx((10 + 5 - 10) / 3)
     assert m["mape"] == pytest.approx((10 / 100 + 10 / 50) / 2 * 100)   # the zero-population unit has no percentage
-    assert m["units_without_cells"] == 1                                 # d: population but no cell centre
-    assert m["mass_gap"] == pytest.approx(155 - 150)
+    assert m["population_difference"] == pytest.approx(155 - 150)
+    assert m["population_product"] == 155 and m["population_census"] == 150
 
 
 def test_refuses_to_overwrite_and_reports_missing_rasters(tmp_path):
@@ -239,16 +240,37 @@ def test_census_units_without_a_polygon_are_listed(tmp_path):
 def test_charts_are_drawn_after_the_tables_and_never_break_the_stage(monkeypatch, tmp_path):
     from stages import stage_04_benchmark as s4
     cfg = {"benchmarking": {"plots": False}}
-    assert s4.run_plots(cfg, "x.toml", 2022) == []                      # switched off
+    assert s4.run_plots(cfg, 2022) == []                                # switched off
 
     import tools.plot_benchmark as pb
     calls = []
-    monkeypatch.setattr(pb, "build", lambda config, year, out, mode, dpi, **kw: calls.append(kw) or [tmp_path / "a.png"])
-    cfg = {"benchmarking": {"plot_kinds": ["scatter", "hexbin"], "plot_scales": ["tract", "district"]}}
-    assert s4.run_plots(cfg, "x.toml", 2022) == [tmp_path / "a.png"]    # one kind each, the bars once
-    assert [c["kind"] for c in calls] == ["scatter", "hexbin"] and calls[0]["scales"] == ("tract", "district")
+    monkeypatch.setattr(pb, "build", lambda settings: calls.append(settings) or [tmp_path / "a.png"])
+    cfg = {"project": {"version": "6"}, "execution": {}, "ingestion": {}, "benchmarking": {
+        "output_dir": str(tmp_path / "{year}"), "plot_kinds": ["scatter", "hexbin"], "plot_scales": ["tract", "district"],
+        "products": {"ext": {"raster": "x.tif", "label": "Ext {year}", "min_scale": "municipality", "years": [2022]},
+                     "old": {"raster": "y.tif", "years": [2010]}}}}
+    assert s4.run_plots(cfg, 2022) == [tmp_path / "a.png"]
+    st = calls[0]
+    assert st["kinds"] == ["scatter", "hexbin"] and st["scales"] == ["tract", "district"] and st["version"] == "6"
+    assert st["products"] == {"ext": {"label": "Ext {year}", "min_scale": "municipality"}}   # 2010-only is left out
 
     def boom(*a, **k):
         raise RuntimeError("no display")
     monkeypatch.setattr(pb, "build", boom)
-    assert s4.run_plots(cfg, "x.toml", 2022) == []                      # a failure is reported, not raised
+    assert s4.run_plots(cfg, 2022) == []                                # a failure is reported, not raised
+
+
+def test_one_product_maps_each_analysis_year_to_its_own_raster_and_epoch():
+    from stages.stage_04_benchmark import products
+    cfg = {"benchmarking": {"products": {
+        "ghsl": {"label": "GHSL {epoch}", "min_scale": "municipality",
+                 "2010": {"raster": "/d/GHSL_{epoch}.tif", "epoch": 2010},
+                 "2022": {"raster": "/d/GHSL_{epoch}.tif", "epoch": 2020}},
+        "ext": {"raster": "/d/EXT_{year}.tif"},                       # no sub-tables: every year, epoch = year
+        "only22": {"raster": "/d/x.tif", "years": [2022]}}}}
+    p22, p10 = products(cfg, 2022), products(cfg, 2010)
+    assert list(p22) == ["ghsl", "ext", "only22"] and list(p10) == ["ghsl", "ext"]
+    assert p22["ghsl"]["raster"] == "/d/GHSL_2020.tif" and p22["ghsl"]["label"] == "GHSL 2020"
+    assert p10["ghsl"]["raster"] == "/d/GHSL_2010.tif" and p10["ghsl"]["min_scale"] == "municipality"
+    assert p22["ext"]["epoch"] == 2022
+    assert "ghsl" not in products(cfg, 2000)                          # a year with no entry: not used

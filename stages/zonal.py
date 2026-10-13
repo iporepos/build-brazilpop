@@ -1,7 +1,7 @@
 """Zonal sums with the cell-centre rule, composed from GDAL command-line tools and numpy.
 
 For one raster and one or more polygon sets ("scales") it returns, per polygon, the sum
-of the cell values and the number of cells counted.
+of the cell values.
 
 How a window is processed (a window is a block of raster rows, so memory is bounded):
 
@@ -102,7 +102,6 @@ def _process_windows(raster: str, info: dict, zone_sets: list[ZoneSet], starts: 
     tmp = Path(tempfile.mkdtemp(dir=tmp_root, prefix="w_"))
     w, gt, nodata = info["width"], info["gt"], info["nodata"]
     sums = {z.name: np.zeros(z.n + 1) for z in zone_sets}
-    counts = {z.name: np.zeros(z.n + 1, dtype=np.int64) for z in zone_sets}
     total = 0.0
     try:
         for y0, h in starts:
@@ -125,10 +124,9 @@ def _process_windows(raster: str, info: dict, zone_sets: list[ZoneSet], starts: 
                 ok = valid & (zon > 0)
                 ids = zon[ok]
                 sums[z.name] += np.bincount(ids, weights=val[ok], minlength=z.n + 1)
-                counts[z.name] += np.bincount(ids, minlength=z.n + 1)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
-    return {"sums": sums, "counts": counts, "total": total, "windows": len(starts)}
+    return {"sums": sums, "total": total, "windows": len(starts)}
 
 
 def rows_with_zones(info: dict, zone_sets: list[ZoneSet]) -> np.ndarray | None:
@@ -150,7 +148,7 @@ def sample_raster(raster: str | Path, zone_sets: list[ZoneSet], *, workers: int 
                   window_cells: int = DEFAULT_WINDOW_CELLS, work_dir: str | Path | None = None) -> dict:
     """Sum `raster` over every polygon of every set.
 
-    Returns {"sums": {scale: array(n+1)}, "counts": {...}, "raster_total": float,
+    Returns {"sums": {scale: array(n+1)}, "raster_total": float,
              "windows": int, "windows_skipped": int}. Index 0 of the arrays is "outside all
     polygons" and is not used for results; zone id i is at index i.
     """
@@ -183,11 +181,9 @@ def sample_raster(raster: str | Path, zone_sets: list[ZoneSet], *, workers: int 
         shutil.rmtree(tmp_root, ignore_errors=True)
 
     out = {"sums": {z.name: np.zeros(z.n + 1) for z in zone_sets},
-           "counts": {z.name: np.zeros(z.n + 1, dtype=np.int64) for z in zone_sets},
            "raster_total": 0.0, "windows": len(windows), "windows_skipped": skipped, "rows_per_window": rows}
     for r in results:
         out["raster_total"] += r["total"]
         for z in zone_sets:
             out["sums"][z.name] += r["sums"][z.name]
-            out["counts"][z.name] += r["counts"][z.name]
     return out

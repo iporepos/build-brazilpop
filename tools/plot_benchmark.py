@@ -7,18 +7,19 @@ small JSON file (tools/plot_config.py; scales, kinds, mode, dpi, accent and the 
 from the pipeline TOML. Stage 4 passes the same settings itself.
 
 
-  1. scatter_{scale}_truth_vs_pred_{year}.png  (or hexbin_..., kind "hexbin"), for the
+  1. scatter_{scale}_truth_vs_pred_{year}.jpg  (or hexbin_..., kind "hexbin"), for the
         scales of `scales` (default tract, district, municipality; a single unit is one dot)
         census residents against the estimate, one panel per product, tracts; dots adapt
         their size and opacity to the number of tracts, hexbin counts tracts per hexagon
-  2. bars_metrics_by_scale_{year}.png
+  2. bars_metrics_by_scale_{year}.jpg
         MAPE, MAE, RMSE and bias, one panel per metric (units differ, so no shared
         axis), horizontal bars grouped by scale with one bar per product
 
-Colours: the product under evaluation (BrazilPop, `accent`) is the accent blue and every
-benchmark is gray (light gray bars, dark gray dots and hexagons). Panels have the seaborn
-darkgrid tone with a white grid. The hexbin density ramps start at a very light tone that
-still differs from the panel. Axes, ticks and tick
+Colours: in the bar chart the product under evaluation (BrazilPop, `accent`) is the accent blue
+and every benchmark is light gray. The scatter and hexbin panels are all gray (dark gray dots and
+hexagons): the blue is only for the bars. Panels have the seaborn
+darkgrid tone with a white grid. The hexbin density uses the plasma colour map, reversed (yellow
+lowest, blue highest). Axes, ticks and tick
 labels all use the colour of the axis labels. Every bar and panel is named, so identity never rests on colour.
 Bars are square-cornered and there is no legend. Product labels
 come from the config (`label`, with {version} and {year} placeholders, e.g. `BrazilPop V6 2022`).
@@ -30,9 +31,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import re
 import sys
+import time
 from pathlib import Path
+
+log = logging.getLogger("plot_benchmark")
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
@@ -44,32 +49,55 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
-from matplotlib.colors import LinearSegmentedColormap, LogNorm, to_rgb  # noqa: E402
+from matplotlib.colors import LogNorm  # noqa: E402
 from matplotlib.ticker import FuncFormatter  # noqa: E402
 
 SCALES = ["tract", "district", "municipality", "state"]
-# Emphasis form: the product under evaluation (BrazilPop) is the accent blue, every benchmark
-# is the same dark gray. Identity is not carried by colour, so each bar is named under it.
+# The product under evaluation (BrazilPop) is the accent blue in the bars, every benchmark is gray.
 ACCENT_KEY = "brazilpop"
-ACCENT = {"light": "#2a78d6", "dark": "#3987e5"}
-NEUTRAL = {"light": "#52514e", "dark": "#898781"}        # scatter points
-BAR_NEUTRAL = {"light": "#a9a8a4", "dark": "#a8a7a0"}    # benchmark bars: a light gray
-PANEL = {"light": "#eaeaf2", "dark": "#2a2a35"}          # seaborn "darkgrid" tone behind every panel
-SURFACE = {"light": "#fcfcfb", "dark": "#1a1a19"}
-INK = {  # primary, secondary, muted
-    "light": ("#0b0b0b", "#2e2d2b", "#6d6c68"),     # labels, axes and ticks use the second tone: strong gray
-    "dark": ("#ffffff", "#e3e2da", "#a8a7a0"),
-}
-GRID = {"light": "#ffffff", "dark": "#3b3b49"}          # white grid on the seaborn tone, as in seaborn darkgrid
-BASELINE = {"light": "#c3c2b7", "dark": "#383835"}
-FONT_CANDIDATES = ["Helvetica", "Helvetica Neue", "Nimbus Sans", "Arial", "Liberation Sans", "DejaVu Sans"]
-TICK_PT = 8        # tick labels and the values written at the bars
-TEXT_PT = 10       # everything else: titles, axis labels, legend, group labels, notes
-NOTE_PT = 8        # the figures written under each scatter / hexbin panel
-FIG_SCALE = 0.75   # page-sized figures: 25% smaller than the first layout, fonts keep their point sizes
-SCATTER_SCALE = 0.8   # the scatter / hexbin figure is a further 20% smaller (fonts unchanged)
-PAD_IN = 0.04      # outer padding, inches (matplotlib default is 0.04); gaps between panels below
-GAP = 0.025        # fraction of the figure between panels (default 0.02 of axes; kept tight)
+FORMAT_EXT = {"jpeg": "jpg", "png": "png", "pdf": "pdf", "svg": "svg"}   # `format` of the settings -> extension
+DEFAULT_CMAP = "plasma_r"      # hexbin colour map: blue is the highest density, yellow the lowest
+
+
+def apply_style(overrides: dict | None = None) -> dict:
+    """Set the style constants of this module: tools/plot_style.py DEFAULT_STYLE with `overrides`
+    (the "style" key of the tool's JSON) laid over it. Called by build() every time, so a style never
+    leaks from one call to the next. Returns the merged style."""
+    from tools.plot_style import COLOR_GLOBALS, GLOBALS, merge
+
+    st = merge(overrides)
+    g = globals()
+    for key, name in GLOBALS.items():
+        g[name] = tuple(st[key]) if isinstance(st[key], list) and key != "fonts" else st[key]
+    for key, name in COLOR_GLOBALS.items():
+        g[name] = {m: (tuple(v) if isinstance(v, list) else v) for m, v in st["colors"][key].items()}
+    return st
+
+
+apply_style()
+
+
+def _clipped_cmap(name: str, low: float = 0.0, high: float = 1.0):
+    """The colour map `name` restricted to the fractions [low, high] of it, rescaled to the full range."""
+    cmap = plt.get_cmap(name)
+    if low <= 0.0 and high >= 1.0:
+        return cmap
+    from matplotlib.colors import ListedColormap
+    return ListedColormap(cmap(np.linspace(low, high, 256)), name=f"{name}_{low:g}_{high:g}")
+
+
+def _save(fig, out: Path, dpi: int) -> None:
+    """Write the figure in the format of the file extension (jpeg quality: style.jpeg_quality)."""
+    if out.suffix.lower() in (".jpg", ".jpeg"):
+        fig.savefig(out, dpi=dpi, format="jpeg", pil_kwargs={"quality": int(JPEG_QUALITY)})
+    else:
+        fig.savefig(out, dpi=dpi)
+
+
+def _landscape(width: float, height: float) -> tuple[float, float]:
+    """Figure size at the landscape ratio LANDSCAPE_RATIO (3:2): the layout's natural size is grown
+    on its short side, never shrunk, so the panels and the fonts keep their size."""
+    return (max(width, height * LANDSCAPE_RATIO), max(height, width / LANDSCAPE_RATIO))
 
 
 def _tighten(fig) -> None:
@@ -96,15 +124,17 @@ def label_of(key: str, labels: dict | None = None) -> str:
     return (labels or {}).get(key) or PRODUCT_LABEL.get(key, key)
 
 
+def order_products(keys: list[str], labels: dict | None = None, accent: str = ACCENT_KEY) -> list[str]:
+    """Standard panel order: the product under evaluation (accent) first, then the others
+    alphabetically by the name shown in the charts."""
+    return sorted(keys, key=lambda k: (k != accent, label_of(k, labels).casefold(), k))
+
+
 def expand_label(text: str, version: str, year: int) -> str:
     """`BrazilPop V{version} {year}` -> `BrazilPop V6 2022`. Labels without placeholders are unchanged."""
     return text.replace("{version}", str(version)).replace("{year}", str(year))
 
 
-BAR_RATIO = 0.68   # bar thickness as a fraction of its row (20% thinner than the previous 0.85)
-GROUP_GAP = 0.8    # empty space between two groups, in rows
-ROW_IN = 0.26      # height of one row in inches (before FIG_SCALE)
-MIN_RAMP_DE = 10.0  # the first colour of a density ramp must differ from the panel by at least this (OKLab x100)
 
 
 def bar_colors(products: list[str], accent: str, mode: str = "light") -> dict[str, str]:
@@ -112,29 +142,41 @@ def bar_colors(products: list[str], accent: str, mode: str = "light") -> dict[st
     return {k: ACCENT[mode] if k == accent else BAR_NEUTRAL[mode] for k in products}
 
 
-def _oklab(rgb) -> np.ndarray:
-    c = np.asarray(rgb, dtype=float)
-    lin = np.where(c <= 0.04045, c / 12.92, ((c + 0.055) / 1.055) ** 2.4)
-    lms = np.cbrt(np.array([[0.4122214708, 0.5363325363, 0.0514459929],
-                            [0.2119034982, 0.6806995451, 0.1073969566],
-                            [0.0883024619, 0.2817188376, 0.6299787005]]) @ lin)
-    return np.array([[0.2104542553, 0.7936177850, -0.0040720468],
-                     [1.9779984951, -2.4285922050, 0.4505937099],
-                     [0.0259040371, 0.7827717662, -0.8086757660]]) @ lms
-
-
 def color_of(key: str, mode: str = "light", accent: str = ACCENT_KEY, neutral: dict | None = None) -> str:
     """Accent blue for the product under evaluation, gray for every benchmark."""
     return ACCENT[mode] if key == accent else (neutral or NEUTRAL)[mode]
 
 
-def short(v: float, pct: bool = False) -> str:
+def thousand_label(v: float, sig: int | None = None) -> str:
+    """Scientific notation anchored at 10^3: 12,500 -> 12.5 x 10^3, 4,000,000 -> 4,000 x 10^3. The
+    exponent never runs, so labels on one axis are comparable at a glance. `sig` = significant digits
+    of the mantissa (None: exact)."""
+    m = v / 1000.0
+    if sig:
+        d = max(0, sig - 1 - int(np.floor(np.log10(abs(m)))))
+        text = f"{m:,.{d}f}"
+        text = text.rstrip("0").rstrip(".") if "." in text else text
+    else:
+        text = f"{m:,g}"
+    return f"{text} × 10$^{{3}}$"
+
+
+def short(v: float, pct: bool = False, sci: bool = True) -> str:
+    """Compact figure for a bar tip or a caption. From SCI_FROM up (`sci`) it is written as a power of ten
+    with an integer mantissa and no spaces, the exponent running: 12,709 -> 1x10^4, 434,102 -> 4x10^5."""
     if v is None or (isinstance(v, float) and np.isnan(v)):
         return "n/a"
     if pct:
         return f"{v:.1f}%"
     a = abs(v)
-    return f"{v / 1000:.1f}k" if a >= 10_000 else f"{v:,.0f}" if a >= 100 else f"{v:.1f}"
+    if sci and a >= SCI_FROM:
+        e = int(np.floor(np.log10(a)))
+        m = int(round(a / 10 ** e))
+        if m == 10:
+            m, e = 1, e + 1
+        sign = "-" if v < 0 else ""
+        return f"{sign}10$^{{{e}}}$" if m == 1 else f"{sign}{m}×10$^{{{e}}}$"
+    return f"{v:,.0f}" if a >= 100 else f"{v:.1f}"
 
 
 def _style(mode: str) -> None:
@@ -158,44 +200,77 @@ def _plural(scale: str, n: int) -> str:
     return word + (("y" if scale == "municipality" else "") if n == 1 else ("ies" if scale == "municipality" else "s"))
 
 
-def _compact(v: float, _=None) -> str:
-    """0, 500, 2,000 ... 50k, 1.5M: keeps the ticks of a district or state axis short."""
-    a = abs(v)
-    if a >= 1e6:
-        return f"{v / 1e6:g}M"
-    if a >= 1e5:
-        return f"{v / 1e3:g}k"
-    return f"{v:,.0f}"
+def pop_label(v: float, _=None) -> str:
+    """A population label: plain below 10,000 (so tract-level labels read as numbers), from there
+    in scientific notation anchored at 10^3 (12,500 -> 12.5 x 10^3)."""
+    return thousand_label(v) if abs(v) >= SCI_FROM else f"{v:,.0f}"
 
 
-def _thousands(ax, axis="y") -> None:
-    f = FuncFormatter(_compact)
-    (ax.yaxis if axis == "y" else ax.xaxis).set_major_formatter(f)
+def _five_ticks(ax, hi: float) -> None:
+    """Five ticks and grid lines per axis, no clutter: the two edges and three in between."""
+    ticks = np.linspace(0, hi, 5)
+    ax.set_xticks(ticks)
+    ax.set_yticks(ticks)
+    if hi >= SCI_FROM:       # scientific notation anchored at 10^3: the ticks hold the thousands, the
+        f = FuncFormatter(lambda v, _: f"{v / 1000:,g}")          # multiplier is written once, in the labels
+        unit = " (× 10$^{3}$)"
+    else:
+        f, unit = FuncFormatter(lambda v, _: f"{v:,.0f}"), ""
+    ax.xaxis.set_major_formatter(f)
+    ax.yaxis.set_major_formatter(f)
+    ax.set_xlabel("Census Population" + unit)
+    ax.set_ylabel("Estimated Population" + unit)
 
 
 # ------------------------------------------------------------------------------ scatter
 
 def _window(tract: pd.DataFrame, products: list[str]) -> float:
-    """Upper axis limit: the bulk of the data (99.5th percentile of census and estimates), rounded up."""
+    """Upper axis limit: the bulk of the data (99.5th percentile of census and estimates), rounded up
+    so that each of the four steps between the five ticks is a round number (1, 2, 2.5 or 5
+    times a power of ten)."""
     pooled = pd.concat([tract["p_k"]] + [tract[f"pi_sum_{k}"] for k in products]).dropna()
-    q = float(pooled.quantile(0.995)) * 1.05
-    if q >= 100_000:                                   # districts, municipalities, states: half a power of ten
-        step = 10 ** int(np.floor(np.log10(q))) / 2
-    else:
-        step = 100 if q < 2000 else 500 if q < 10000 else 1000
-    return float(np.ceil(q / step) * step)
+    quarter = max(float(pooled.quantile(0.995)) * 1.05, 1.0) / 4
+    e = 10.0 ** np.floor(np.log10(quarter))
+    step = next(m * e for m in (1, 2, 2.5, 5, 10) if m * e >= quarter * (1 - 1e-9))
+    return float(4 * step)
 
 
-def _density_ramp(is_accent: bool, mode: str) -> LinearSegmentedColormap:
-    """Hexbin colours, few tracts to many: one hue from a very light tone to the full colour (the
-    accent blue for the product under evaluation, a dark gray for the benchmarks). The first tone
-    is the lightest blend that still differs from the panel by MIN_RAMP_DE, so a single tract is
-    visible and never melts into the background."""
-    bg = np.array(to_rgb(PANEL[mode]))
-    fg = np.array(to_rgb(ACCENT[mode] if is_accent else (NEUTRAL["light"] if mode == "light" else BAR_NEUTRAL["dark"])))
-    t = next((t for t in np.arange(0.05, 1.0, 0.01)
-              if 100 * np.linalg.norm(_oklab(bg + (fg - bg) * t) - _oklab(bg)) >= MIN_RAMP_DE), 0.3)
-    return LinearSegmentedColormap.from_list("density", [tuple(bg + (fg - bg) * t), tuple(fg)])
+def hex_bounds(counts: np.ndarray) -> tuple[float, float]:
+    """(low, high) of the shared hexbin colour scale: the HEX_CLIP_PCT percentiles (5th, 95th) of the
+    hexagon counts, each snapped to the nearest power of ten (10, 10^2 ...), at least one decade
+    apart. Hard rule: the bottom is never below HEX_FLOOR (10), so hexagons with fewer units all share
+    the lowest colour. Hexagons outside the range take the end colours, so a few extreme cells at
+    either end do not wash out the rest. Feed it the counts of EVERY panel for one composite scale."""
+    counts = np.asarray(counts, dtype=float)
+    counts = counts[np.isfinite(counts) & (counts > 0)]
+    if not counts.size:
+        return HEX_FLOOR, HEX_FLOOR * 10.0
+    snap = lambda p: 10.0 ** round(np.log10(max(float(p), 1.0)))      # noqa: E731
+    lo = max(snap(np.percentile(counts, HEX_CLIP_PCT[0])), HEX_FLOOR)
+    hi = snap(np.percentile(counts, HEX_CLIP_PCT[1]))
+    return lo, max(hi, lo * 10.0)
+
+
+def hex_counts(tract: pd.DataFrame, products: list[str], gridsize: int | None = None) -> np.ndarray:
+    """Tracts per hexagon of every product panel of one figure, pooled (same binning as the panels)."""
+    keys = [k for k in products if f"pi_sum_{k}" in tract.columns]
+    if not keys:
+        return np.array([])
+    hi = _window(tract, keys)
+    fig, ax = plt.subplots()
+    out = []
+    try:
+        for k in keys:
+            d = tract[tract["p_k"].notna() & tract[f"pi_sum_{k}"].notna()]
+            x, y = d["p_k"].to_numpy(), d[f"pi_sum_{k}"].to_numpy()
+            inside = (x <= hi) & (y <= hi)
+            if inside.any():
+                hb = ax.hexbin(x[inside], y[inside], gridsize=(gridsize or HEX_GRIDSIZE) if inside.sum() > 300 else HEX_GRIDSIZE_SMALL,
+                               extent=(0, hi, 0, hi), mincnt=1)
+                out.append(np.ma.compressed(hb.get_array()))
+    finally:
+        plt.close(fig)
+    return np.concatenate(out) if out else np.array([])
 
 
 def _point_style(n: int, accent_product: bool) -> tuple[float, float]:
@@ -205,42 +280,46 @@ def _point_style(n: int, accent_product: bool) -> tuple[float, float]:
         return 36.0, 0.9
     scale = min(1.0, (300.0 / max(n, 1)) ** 0.5)
     alpha = float(np.clip(0.35 * scale * (1.0 if accent_product else 0.9), 0.012, 0.35))
-    size = float(np.clip(7.0 * scale ** 0.5 * 1.4, 1.2, 7.0))
+    size = float(np.clip(7.0 * scale ** 0.5 * 1.4, 1.2, 7.0)) * DOT_SIZE_SCALE     # alpha rule untouched
     return size, alpha
+
+
+def _hex_cax(ax):
+    """Axes of the horizontal colour bar: HEX_BAR_SHRINK of the panel width, starting at its left edge,
+    HEX_BAR_PAD (in panel heights) below the panel, thin by HEX_BAR_ASPECT. A child of the panel, so
+    its position follows the panel and the layout reserves its room."""
+    return ax.inset_axes([0.0, -HEX_BAR_PAD, HEX_BAR_SHRINK, HEX_BAR_SHRINK / HEX_BAR_ASPECT])
 
 
 def _null_scatter_panel(ax, fig, key, hi, kind, mode, ink, labels, scale="tract",
                         reason="no data") -> None:
     """A panel with the same frame as the others and no data, so the row keeps its place."""
-    ax.plot([0, hi], [0, hi], color=ink[2], linewidth=1.0, zorder=3)
+    ax.plot([0, hi], [0, hi], color=ink[2], linewidth=1.0, alpha=ONE_TO_ONE_ALPHA, zorder=3)
     ax.set_xlim(0, hi)
     ax.set_ylim(0, hi)
     ax.set_aspect("equal", adjustable="box")
-    _thousands(ax, "x")
-    _thousands(ax, "y")
-    ax.set_ylabel("Raster Residents")
-    ax.set_xlabel(f"Census Residents ({scale.capitalize()} level)")
+    _five_ticks(ax, hi)
     ax.set_title(f"{label_of(key, labels)}  ·  {reason}", loc="left", fontsize=TEXT_PT, fontweight="bold",
-                 color=ink[0])
+                 color=SUBTITLE[mode])
     ax.text(0.5, 0.5, reason, transform=ax.transAxes, ha="center", va="center", fontsize=TEXT_PT,
             color=ink[2])
-    if kind == "hexbin":                      # an invisible colour bar keeps the panel as wide as the others
+    if kind == "hexbin":                      # an invisible colour bar keeps the panel as tall as the others
         from matplotlib.cm import ScalarMappable
         from matplotlib.colors import ListedColormap
-        cb = fig.colorbar(ScalarMappable(norm=LogNorm(vmin=1, vmax=10),
-                                         cmap=ListedColormap([SURFACE[mode]])), ax=ax, shrink=0.55, pad=0.02,
-                          aspect=22)
-        cb.set_ticks([])
+        cb = fig.colorbar(ScalarMappable(norm=LogNorm(vmin=1, vmax=10), cmap=ListedColormap([SURFACE[mode]])),
+                          cax=_hex_cax(ax), orientation="horizontal")
+        cb.set_ticks([1, 10])
         cb.ax.minorticks_off()
-        cb.ax.tick_params(which="both", length=0)
+        cb.ax.tick_params(which="both", length=0, labelsize=TICK_PT, labelcolor=SURFACE[mode])
         cb.outline.set_visible(False)
-        cb.set_label(" ", fontsize=TEXT_PT)
 
 
 def scatter_truth_vs_pred(tract: pd.DataFrame, metrics: pd.DataFrame, products: list[str], out: Path,
                           title: str, mode: str = "light", dpi: int = 150, labels: dict | None = None,
-                          accent: str = ACCENT_KEY, kind: str = "scatter", gridsize: int = 70,
-                          null_products: list[str] | None = None, scale: str = "tract") -> Path:
+                          accent: str = ACCENT_KEY, kind: str = "scatter", gridsize: int | None = None,
+                          null_products: list[str] | None = None, scale: str = "tract",
+                          hex_range: tuple[float, float] | None = None, cmap: str = DEFAULT_CMAP,
+                          cmap_range: tuple[float, float] = (0.0, 1.0)) -> Path:
     """One square panel per product, three across (5 products: 3 above, 2 below): census residents
     (x) against the estimate (y), one point per unit of `scale` (tract, district, municipality,
     state; the table passed in is the one of that scale). A product that is not scored at this
@@ -254,7 +333,10 @@ def scatter_truth_vs_pred(tract: pd.DataFrame, metrics: pd.DataFrame, products: 
 
     kind="scatter" draws one dot per tract (size and opacity adapt to the number of tracts);
     kind="hexbin" counts tracts per hexagon on a log colour scale, which is the one to use
-    for a national run. Only points inside the axes are handed to the renderer.
+    for a national run. Only points inside the axes are handed to the renderer. `hex_range` is
+    its (low, high) colour scale; None takes it from this figure's own panels (hex_bounds). `cmap`
+    is the matplotlib colour map of the hexagons and `cmap_range` the (low, high) fractions of it that are
+    used, so a bright end can be left out.
     """
     if kind not in ("scatter", "hexbin"):
         raise ValueError(f"kind must be 'scatter' or 'hexbin', not {kind!r}")
@@ -265,17 +347,18 @@ def scatter_truth_vs_pred(tract: pd.DataFrame, metrics: pd.DataFrame, products: 
     hi = _window(tract, [k for k in products if k not in nulls])
     cols = min(n, 3)                                      # three across, then the rest on the next row
     rows = -(-n // cols)                                  # (5 products: 3 above, 2 below)
-    w, h = (6.5, 6.9) if kind == "hexbin" else (5.6, 7.0)          # hexbin panels also carry a colour bar
-    fig, axes = plt.subplots(rows, cols, figsize=(w * cols * FIG_SCALE * SCATTER_SCALE,
-                                                  h * rows * FIG_SCALE * SCATTER_SCALE),
+    w, h = (5.6, 8.3) if kind == "hexbin" else (5.6, 7.0)          # hexbin panels also carry a colour bar
+    fig, axes = plt.subplots(rows, cols, figsize=_landscape(w * cols * FIG_SCALE * SCATTER_SCALE,
+                                                            h * rows * FIG_SCALE * SCATTER_SCALE),
                              squeeze=False, layout="constrained")
     _tighten(fig)
     fig.suptitle(title, x=0.01, ha="left", fontsize=TEXT_PT, fontweight="bold", color=ink[0])
     for extra in list(axes.flat)[n:]:
         extra.set_visible(False)
 
+    hexes = []
     for ax, key in zip(axes.flat, products):
-        col = color_of(key, mode, accent)
+        col = INK[mode][0]                      # scatter dots are black (white in dark mode); the accent blue is for the bars
         ax.set_facecolor(PANEL[mode])
         ax.set_axisbelow(True)
         ax.grid(True, linewidth=1.0)
@@ -290,32 +373,28 @@ def scatter_truth_vs_pred(tract: pd.DataFrame, metrics: pd.DataFrame, products: 
         inside = (x <= hi) & (y <= hi)                     # what is beyond the axes is counted, not drawn
         x, y = x[inside], y[inside]
         if kind == "hexbin":
-            hb = ax.hexbin(x, y, gridsize=gridsize if len(x) > 300 else 22, extent=(0, hi, 0, hi), mincnt=1,
-                           norm=LogNorm(vmin=1),
-                           cmap=_density_ramp(key == accent, mode),
+            hb = ax.hexbin(x, y, gridsize=(gridsize or HEX_GRIDSIZE) if len(x) > 300 else HEX_GRIDSIZE_SMALL, extent=(0, hi, 0, hi), mincnt=1,
+                           norm=LogNorm(vmin=1, vmax=10, clip=True),             # vmax is set once all panels are known
+                           cmap=_clipped_cmap(cmap, *cmap_range),
                            edgecolors="face", linewidths=0.3, zorder=2, rasterized=True)
-            hb.set_clim(1, max(10.0, float(np.ma.max(hb.get_array()))))     # a lone unit: scale still reads 1 to 10
-            cb = fig.colorbar(hb, ax=ax, shrink=0.55, pad=0.02, aspect=22)
-            cb.set_label("tracts per hexagon", fontsize=TEXT_PT, color=ink[1])
-            cb.ax.tick_params(labelsize=TICK_PT, color=ink[1], labelcolor=ink[1])
-            cb.outline.set_edgecolor(ink[1])
+            hexes.append((ax, hb))
         else:
-            size, alpha = _point_style(len(x), key == accent)
+            size, alpha = _point_style(len(x), False)
+            if scale != "tract":              # few units (districts, municipalities, states): opaque black dots
+                alpha = 1.0
             ax.plot(x, y, linestyle="", marker="o", markersize=size ** 0.5, markeredgewidth=0, color=col,
                     alpha=alpha, zorder=2, rasterized=True)
-        ax.plot([0, hi], [0, hi], color=ink[2], linewidth=1.0, zorder=3)             # 1:1 reference
+        ax.plot([0, hi], [0, hi], color=ink[2], linewidth=1.0, alpha=ONE_TO_ONE_ALPHA, zorder=3)   # 1:1 reference, over the data
         ax.set_xlim(0, hi)
         ax.set_ylim(0, hi)
         ax.set_aspect("equal", adjustable="box")
-        _thousands(ax, "x")
-        _thousands(ax, "y")
-        ax.set_ylabel("Raster Residents")
+        _five_ticks(ax, hi)
 
         m = metrics[(metrics["product"] == key) & (metrics["scale"] == scale)]
         res = m["resolution"].iloc[0] if len(m) else ""
-        sub = "external raster" if res == "external" else f"{res} raster" if res else ""
+        sub = "" if res == "external" else f"{res} raster" if res else ""     # a benchmark needs no remark
         ax.set_title(f"{label_of(key, labels)}  ·  {sub}" if sub else label_of(key, labels), loc="left",
-                     fontsize=TEXT_PT, fontweight="bold", color=ink[0])
+                     fontsize=TEXT_PT, fontweight="bold", color=SUBTITLE[mode])
         # the same statistics as the metrics file; computed from the table when the product is
         # not scored at tract scale (its min_scale is higher), so every panel is readable
         e = d[f"pi_sum_{key}"] - d["p_k"]
@@ -328,7 +407,7 @@ def scatter_truth_vs_pred(tract: pd.DataFrame, metrics: pd.DataFrame, products: 
         outside = d[(d["p_k"] > hi) | (d[f"pi_sum_{key}"] > hi)]
         err = (d[f"pi_sum_{key}"] - d["p_k"]).abs()
         noun = _plural(scale, int(stats["units"]))
-        caption = [f"{int(stats['units']):,} {noun}  ·  MAE {short(stats['mae'])}  ·  "
+        caption = [f"{int(stats['units']):,} {noun}  ·  MAE {short(stats['mae'], sci=False)}  ·  "
                    f"MAPE {short(stats['mape'], True)}",
                    f"estimate / census {stats['ratio']:.3f}"
                    + (f"  ·  {len(outside)} beyond the axes" if len(outside) else "")]
@@ -336,18 +415,129 @@ def scatter_truth_vs_pred(tract: pd.DataFrame, metrics: pd.DataFrame, products: 
             w = d.loc[err.idxmax()]
             caption.append(f"largest error: {scale} {w['code']}")
             caption.append(f"census {w['p_k']:,.0f}, estimate {w[f'pi_sum_{key}']:,.0f}")
-        # the figures sit under the panel, below the centred axis label, never over the data (a
-        # national run fills the whole panel): small, light gray, flush left. The annotation is
-        # narrower than the panel, so the layout reserves its height without squeezing the axes.
-        ax.set_xlabel(f"Census Residents ({scale.capitalize()} level)")
-        ax.annotate("\n".join(caption), xy=(0, 0), xycoords="axes fraction", xytext=(0, -33),
-                    textcoords="offset points", ha="left", va="top", multialignment="left",
-                    fontsize=NOTE_PT, color=ink[2], linespacing=1.5, annotation_clip=False)
+        # the figures sit under the panel, below the centred axis label (and, in a hexbin figure,
+        # below the colour bar), never over the data: small, light gray, flush left. The annotation
+        # is narrower than the panel, so the layout reserves its height without squeezing the axes.
+        text = "\n".join(caption)
+        if kind == "hexbin":
+            hexes[-1] = (*hexes[-1], text)         # anchored to the colour bar, drawn once it exists
+        else:
+            ax.annotate(text, xy=(0, 0), xycoords="axes fraction", xytext=(0, -33),
+                        textcoords="offset points", ha="left", va="top", multialignment="left",
+                        fontsize=NOTE_PT, color=ink[2], linespacing=1.5, annotation_clip=False)
         ax.text(hi * 0.985, hi * 0.93, "1:1", color=ink[2], fontsize=TICK_PT, ha="right", va="top", rotation=45,
                 rotation_mode="anchor")
 
+    if hexes:         # one colour scale for every panel (and, from build(), for every figure)
+        lo, top = hex_range or hex_bounds(np.concatenate([np.ma.compressed(hb.get_array()) for _, hb, _text in hexes]))
+        ticks = [10.0 ** e for e in range(int(round(np.log10(lo))), int(round(np.log10(top))) + 1)]
+        for ax, hb, text in hexes:
+            hb.set_norm(LogNorm(vmin=lo, vmax=top, clip=True))
+            # horizontal, below the x axis title and above the figures of the panel
+            # the bar starts at the left edge of the axes (like the figures under it); the units
+            # comment sits right after its end
+            cb = fig.colorbar(hb, cax=_hex_cax(ax), orientation="horizontal", extend="both" if lo > 1 else "max")
+            cb.set_ticks(ticks)
+            cb.ax.xaxis.set_major_formatter(FuncFormatter(lambda v, _: sci_label(v)))
+            cb.ax.minorticks_off()
+            cb.ax.tick_params(labelsize=TICK_PT, color=ink[1], labelcolor=ink[1])
+            cb.outline.set_edgecolor(ink[1])
+            cb.ax.text(1.10, 0.5, f"{_plural(scale, 2).capitalize()} count", transform=cb.ax.transAxes,
+                       ha="left", va="center", fontsize=TICK_PT, color=ink[1])      # units, next to the bar
+            cb.ax.annotate(text, xy=(0, 0), xycoords=(ax, cb.ax), xytext=(0, -26),
+                           textcoords="offset points", ha="left", va="top", multialignment="left",
+                           fontsize=NOTE_PT, color=ink[2], linespacing=1.5, annotation_clip=False)
+
     out.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out, dpi=dpi)
+    _save(fig, out, dpi)
+    plt.close(fig)
+    return out
+
+
+# ------------------------------------------------------------------------- error histograms
+
+def _nice_up(v: float, mantissas: tuple[float, ...]) -> float:
+    """Smallest m x 10^k (m in `mantissas`) that is >= v."""
+    v = max(float(v), 1e-9)
+    e = 10.0 ** np.floor(np.log10(v))
+    return float(next(m * e for m in mantissas if m * e >= v * (1 - 1e-9)))
+
+
+def error_histograms(tract: pd.DataFrame, products: list[str], out: Path, title: str, mode: str = "light",
+                     dpi: int = 150, labels: dict | None = None, null_products: list[str] | None = None,
+                     scale: str = "tract") -> Path:
+    """The scatter's layout, with the histogram of the error (estimate - census) of the units of
+    `scale` in every panel. Made to be compared: the error axis is in the actual units (population),
+    symmetric, the same in every panel: it spans the widest central 90% interval (5th to 95th
+    percentile) of the panels, so the tails beyond it are only counted; there
+    are HIST_BINS (100) equal bins over it, in every panel and every figure; the vertical axis is the
+    share of the panel's units in each bin, in percent, with one limit for all panels. Bars are the
+    gray of the bar chart."""
+    _style(mode)
+    ink = INK[mode]
+    nulls = set(null_products or [])
+    present = [k for k in products if k not in nulls and f"pi_sum_{k}" in tract.columns]
+    errs, nunits = {}, {}
+    for k in present:
+        d = tract[tract["p_k"].notna() & tract[f"pi_sum_{k}"].notna()]
+        errs[k] = (d[f"pi_sum_{k}"] - d["p_k"]).to_numpy(dtype=float)
+        nunits[k] = len(d)
+    pooled = np.concatenate([e for e in errs.values() if len(e)]) if errs else np.array([])
+    if pooled.size == 0:
+        raise ValueError("no unit with a census total and an estimate: nothing to draw")
+    # the window holds the central 90% of the errors of the panel that needs the most room
+    lo_q, hi_q = HIST_WINDOW_PCT[0] / 100, HIST_WINDOW_PCT[1] / 100
+    reach = max(max(abs(float(np.quantile(e, lo_q))), abs(float(np.quantile(e, hi_q)))) for e in errs.values() if len(e))
+    limit = _nice_up(reach * 1.05, (1, 2, 4, 6, 8, 10))
+    edges = np.linspace(-limit, limit, HIST_BINS + 1)                    # the same 100 bins everywhere
+    share = {k: 100.0 * np.histogram(e, bins=edges)[0] / max(len(e), 1) for k, e in errs.items()}
+    top = max((float(v.max()) for v in share.values() if len(v)), default=1.0)
+    ymax = 4 * _nice_up(top * 1.05 / 4, (1, 1.25, 2, 2.5, 5, 10))            # quarters are round numbers
+
+    n = len(products)
+    cols = min(n, 3)
+    rows = -(-n // cols)
+    fig, axes = plt.subplots(rows, cols, figsize=_landscape(5.6 * cols * FIG_SCALE * SCATTER_SCALE,
+                                                            7.0 * rows * FIG_SCALE * SCATTER_SCALE),
+                             squeeze=False, layout="constrained")
+    _tighten(fig)
+    fig.suptitle(title, x=0.01, ha="left", fontsize=TEXT_PT, fontweight="bold", color=ink[0])
+    for extra in list(axes.flat)[n:]:
+        extra.set_visible(False)
+
+    thousands = limit >= SCI_FROM            # scientific notation anchored at 10^3, as on the scatter axes
+    unit = " (× 10$^{3}$)" if thousands else ""
+    fmt = FuncFormatter((lambda v, _: f"{v / 1000:,g}") if thousands else (lambda v, _: f"{v:,.0f}"))
+    for ax, key in zip(axes.flat, products):
+        ax.set_facecolor(PANEL[mode])
+        ax.set_axisbelow(True)
+        ax.grid(True, linewidth=1.0)
+        ax.set_xlim(-limit, limit)
+        ax.set_ylim(0, ymax)
+        ax.set_box_aspect(2 / 3)                                          # the frame is 3:2 landscape
+        ax.set_xticks(np.linspace(-limit, limit, 5))
+        ax.set_yticks(np.linspace(0, ymax, 5))
+        ax.xaxis.set_major_formatter(fmt)
+        ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:g}"))
+        ax.set_xlabel("Error (estimate − census)" + unit)
+        ax.set_ylabel("Share of units (%)")
+        ax.set_title(label_of(key, labels), loc="left", fontsize=TEXT_PT, fontweight="bold", color=SUBTITLE[mode])
+        if key not in errs or not len(errs[key]):
+            ax.text(0.5, 0.5, "no data" if key in nulls or key not in errs else "not scored at this scale",
+                    transform=ax.transAxes, ha="center", va="center", fontsize=TEXT_PT, color=ink[2])
+            continue
+        e = errs[key]
+        ax.stairs(share[key], edges, fill=True, color=BAR_NEUTRAL[mode], zorder=2)
+        beyond = int((np.abs(e) > limit).sum())
+        caption = [f"{len(e):,} {_plural(scale, len(e))}  ·  MAE {short(float(np.abs(e).mean()), sci=False)}"
+                   f"  ·  bias {float(e.mean()):+,.0f}",
+                   f"median error {float(np.median(e)):+,.0f}" + (f"  ·  {beyond} beyond the axes" if beyond else "")]
+        ax.annotate("\n".join(caption), xy=(0, 0), xycoords="axes fraction", xytext=(0, -33),
+                    textcoords="offset points", ha="left", va="top", multialignment="left",
+                    fontsize=NOTE_PT, color=ink[2], linespacing=1.5, annotation_clip=False)
+
+    out.parent.mkdir(parents=True, exist_ok=True)
+    _save(fig, out, dpi)
     plt.close(fig)
     return out
 
@@ -356,18 +546,23 @@ def scatter_truth_vs_pred(tract: pd.DataFrame, metrics: pd.DataFrame, products: 
 
 PANELS = [  # column, title, unit, percentage?, signed?
     ("mape", "Mean absolute percentage error", "% error per unit", True, False),
-    ("mae", "Mean absolute error", "residents per unit", False, False),
-    ("rmse", "Root mean square error", "residents per unit", False, False),
-    ("bias", "Bias (estimate − census)", "residents per unit", False, True),
+    ("mae", "Mean absolute error", "Population per unit", False, False),
+    ("rmse", "Root mean square error", "Population per unit", False, False),
+    ("bias", "Bias (estimate − census)", "Population per unit", False, True),
 ]
 
 
-def sci_label(v: float) -> str:
-    """Scientific notation for an axis tick: 10^3, -10^4, 2x10^2 (mathtext)."""
+def sci_label(v: float, sig: int | None = None) -> str:
+    """Scientific notation: 10^3, -10^4, 2x10^2 (mathtext). `sig` limits the significant digits
+    of the mantissa (1,234 -> 1.2x10^3 with sig=2); None keeps it exact (axis ticks)."""
     if v == 0:
         return "0"
-    e = int(np.floor(np.log10(abs(v)) + 1e-9))
-    m = abs(v) / 10 ** e
+    if sig:
+        mant, exp = f"{abs(v):.{sig - 1}e}".split("e")
+        m, e = float(mant), int(exp)
+    else:
+        e = int(np.floor(np.log10(abs(v)) + 1e-9))
+        m = abs(v) / 10 ** e
     sign = "-" if v < 0 else ""
     if abs(m - 1) < 1e-6:
         return f"${sign}10^{{{e}}}$"
@@ -400,7 +595,7 @@ def bars_metrics_by_scale(metrics: pd.DataFrame, products: list[str], out: Path,
     per_group = (n + 1 + GROUP_GAP) * ROW_IN            # inches of height: scale label row + bars + gap
     panel_h = len(scales) * per_group + 1.25             # + title, value axis and its label
     fig, axes = plt.subplots(1, len(PANELS), sharey=True, layout="constrained", dpi=dpi,
-                             figsize=((2.4 + 3.6 * len(PANELS)) * FIG_SCALE, (panel_h + 0.5) * FIG_SCALE))
+                             figsize=_landscape((2.4 + 3.6 * len(PANELS)) * FIG_SCALE, (panel_h + 0.5) * FIG_SCALE))
     _tighten(fig)
     fig.suptitle(title, x=0.01, ha="left", fontsize=TEXT_PT, fontweight="bold", color=ink[0])
 
@@ -484,13 +679,21 @@ def bars_metrics_by_scale(metrics: pd.DataFrame, products: list[str], out: Path,
             right = v >= 0
             ax.annotate(short(v, pct), xy=(tip, yc), xytext=(4 if right else -4, 0),
                         textcoords="offset points", ha="left" if right else "right", va="center",
-                        fontsize=TICK_PT, color=ink[1])
+                        fontsize=BAR_VALUE_PT, color=ink[1])
 
+    # the frame (the four panels, same height) is BAR_FRAME_SCALE of what the layout gave it
+    fig.canvas.draw()
+    box = axes[0].get_position()
+    fw, fh = fig.get_size_inches()
+    frame_aspect = (box.height * fh) / (box.width * fw)
+    for ax in axes:
+        ax.set_box_aspect(BAR_FRAME_SCALE * frame_aspect)
+        ax.set_anchor("N")
     if footnote:
         import textwrap
         fig.supxlabel(textwrap.fill(footnote, 150), x=0.01, ha="left", fontsize=TEXT_PT, color=ink[2])
     out.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out, dpi=dpi)
+    _save(fig, out, dpi)
     plt.close(fig)
     return out
 
@@ -517,9 +720,12 @@ def build(settings: dict) -> list[Path]:
     from tools.plot_config import validate
 
     st = validate(settings)
+    apply_style(st["style"])                 # defaults of tools/plot_style.py + the "style" of the settings
+    ext = FORMAT_EXT[st["format"]]
     year, kinds, scales, mode, dpi, accent = st["year"], st["kinds"], st["scales"], st["mode"], st["dpi"], st["accent"]
     base = Path(st["input_dir"].replace("{year}", str(year)))
     pattern = {n: st[f"{n}_pattern"] for n in ("table", "metrics", "report")}
+    log.info("reading the Stage 4 tables of %s from %s", year, base)
     report_p = base / pattern["report"].format(year=year)
     report = json.loads(report_p.read_text()) if report_p.is_file() else {}
     epochs = report.get("epochs", {})
@@ -528,6 +734,7 @@ def build(settings: dict) -> list[Path]:
     metrics = pd.read_csv(base / pattern["metrics"].format(year=year)).rename(
         columns={"ratio_product_to_census": "ratio"})        # the charts' short name
 
+    log.info("tract table: %d rows; metrics: %d rows", len(tract), len(metrics))
     spec = st["products"]
     if spec is None:                         # no list: what the table holds, named by the Stage 4 report
         spec = {c[len("pi_sum_"):]: {} for c in tract.columns if c.startswith("pi_sum_")}
@@ -542,7 +749,7 @@ def build(settings: dict) -> list[Path]:
         if s.get("label"):
             labels[k] = s["label"]
     labels = {k: expand_label(v, st["version"], year) for k, v in labels.items()}
-    all_keys = keys + nulls
+    all_keys = order_products(keys + nulls, labels, accent)      # the same order in every chart
 
     run_ufs = report.get("ufs", [])
     ufs = ("Brazil" if len(run_ufs) >= 27 else f"{len(run_ufs)} UFs" if len(run_ufs) > 6
@@ -560,20 +767,56 @@ def build(settings: dict) -> list[Path]:
     for k in nulls:
         notes.append(f"{label_of(k, labels)} has no data in this run")
     written = []
+    hex_range = None
+    t_all = time.time()
+    if "hexbin" in kinds:                 # one composite colour scale: the counts of every scale and product
+        pooled = []
+        for i, scale in enumerate(scales, 1):
+            p = base / pattern["table"].format(year=year, scale=scale)
+            if p.is_file():
+                t0 = time.time()
+                log.info("hexbin colour scale: counting the hexagons of the %s table (%d/%d) ...", scale, i, len(scales))
+                tbl = tract if scale == "tract" else plain_columns(pd.read_csv(p, dtype={"code": str}), epochs)
+                pooled.append(hex_counts(tbl, keys))
+                log.info("  %s: %d hexagons (%.1fs)", scale, len(pooled[-1]), time.time() - t0)
+        hex_range = hex_bounds(np.concatenate(pooled)) if pooled else None
+        if hex_range:
+            log.info("hexbin colour scale: %g to %g units per hexagon", *hex_range)
+    total, done = len(kinds) * len(scales) + 1, 0
+
+    def drawn(path: Path, t0: float) -> None:
+        nonlocal done
+        done += 1
+        written.append(path)
+        log.info("[%d/%d] %s (%.1fs)", done, total, path.name, time.time() - t0)
+
     for kind in kinds:
-        for scale in scales:              # one figure per scale; a state or a municipality may be one point
+        for scale in scales:
             path = base / pattern["table"].format(year=year, scale=scale)
-            if not path.is_file():
-                print(f"skipped the {scale} {kind}: {path} not found", file=sys.stderr)
+            if not path.is_file():            # one figure per scale; a state or a municipality may be one point
+                log.warning("skipped the %s %s: %s not found", scale, kind, path)
+                done += 1
                 continue
+            log.info("drawing the %s of the %s scale ...", kind, scale)
+            t0 = time.time()
             table = tract if scale == "tract" else plain_columns(pd.read_csv(path, dtype={"code": str}), epochs)
-            written.append(scatter_truth_vs_pred(
-                table, metrics, all_keys, out / f"{kind}_{scale}_truth_vs_pred_{year}.png",
+            if kind == "histogram":
+                drawn(error_histograms(
+                    table, all_keys, out / f"histogram_{scale}_error_{year}.{ext}",
+                    f"{_plural(scale, 2).capitalize()}, {ufs} {year}: error of the estimate", mode, dpi, labels,
+                    null_products=nulls, scale=scale), t0)
+                continue
+            drawn(scatter_truth_vs_pred(
+                table, metrics, all_keys, out / f"{kind}_{scale}_truth_vs_pred_{year}.{ext}",
                 f"{_plural(scale, 2).capitalize()}, {ufs} {year}: estimate against census", mode, dpi, labels,
-                accent, kind, null_products=nulls, scale=scale))
-    written.append(bars_metrics_by_scale(
-        metrics, all_keys, out / f"bars_metrics_by_scale_{year}.png", f"Accuracy by scale, {ufs} {year}",
-        mode, dpi, footnote="; ".join(notes), labels=labels, accent=accent, null_products=nulls))
+                accent, kind, null_products=nulls, scale=scale, hex_range=hex_range, cmap=st["cmap"],
+                cmap_range=(st["cmap_min"], st["cmap_max"])), t0)
+    log.info("drawing the accuracy bars ...")
+    t0 = time.time()
+    drawn(bars_metrics_by_scale(
+        metrics, all_keys, out / f"bars_metrics_by_scale_{year}.{ext}", f"Accuracy by scale, {ufs} {year}",
+        mode, dpi, footnote="; ".join(notes), labels=labels, accent=accent, null_products=nulls), t0)
+    log.info("%d figures in %s (%.1fs)", len(written), out, time.time() - t_all)
     return written
 
 
@@ -583,6 +826,7 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--config", required=True, help="JSON settings (see tools/plot_benchmark.example.json)")
     args = ap.parse_args(argv)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     try:
         for p in build(load(args.config)):
             print(p)

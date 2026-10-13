@@ -277,6 +277,11 @@ plot_kinds   = ["scatter", "hexbin"]                     # one dots-per-unit fig
 plot_scales  = ["tract", "district", "municipality"]    # "state" may be added
 plot_mode    = "light"                                   # or "dark"
 plot_dpi     = 150
+plot_cmap    = "plasma_r"                                # hexbin colour map (matplotlib name); plasma_r: blue = densest
+# plot_cmap_min = 0.0 ; plot_cmap_max = 1.0     # use only this part (0..1) of the colour map, e.g. 0.85 drops a bright end
+plot_format  = "jpeg"                                   # jpeg (.jpg), png, pdf or svg
+# Style overlay (any key of tools/plot_style.py), as a table below [benchmarking]:  [benchmarking.plot_style]
+#   tick_pt = 9 ; hist_bins = 60 ; colors = { panel = { light = "#f0f0f6" } }
 
 # District and municipality polygons per census year, in YOUR file naming and columns.
 # `<scale>_name_column` is optional (a readable name in the tables).

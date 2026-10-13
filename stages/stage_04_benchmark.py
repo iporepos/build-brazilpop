@@ -386,6 +386,11 @@ def plot_settings(cfg: dict, year: int) -> dict:
         "scales": list(b.get("plot_scales", ["tract", "district", "municipality"])),
         "mode": b.get("plot_mode", "light"),
         "dpi": int(b.get("plot_dpi", 150)),
+        "cmap": b.get("plot_cmap", "plasma_r"),
+        "cmap_min": b.get("plot_cmap_min", 0.0),
+        "cmap_max": b.get("plot_cmap_max", 1.0),
+        "format": b.get("plot_format", "jpeg"),
+        "style": dict(b.get("plot_style", {})),
         "products": {k: {f: spec[f] for f in ("label", "min_scale") if spec.get(f)}
                      for k, spec in products(cfg, year).items()} or None,
         "table_pattern": b.get("table_pattern", "benchmark_{year}_{scale}.csv"),

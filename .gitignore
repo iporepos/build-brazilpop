@@ -6,7 +6,7 @@ local.test.toml
 scripts/
 .idea
 /data/tests
-
+paper/
 local.*
 *.local.*
 
